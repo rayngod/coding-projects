@@ -1,5 +1,8 @@
+import 'dart:async';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'dart:io';
+import 'dart:math';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -8,8 +11,12 @@ import 'package:camera/camera.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
-import 'hq_sam_tracer.dart';
-import 'opti_flow_tracker.dart';
+import 'package:opencv_dart/opencv_dart.dart' as cv;
+import 'package:onnxruntime/onnxruntime.dart';
+
+// =============================================================================
+// APP ENTRY & CAMERA RECORDING SCREEN
+// =============================================================================
 
 late List<CameraDescription> _cameras;
 
@@ -26,7 +33,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Dual Frame Speed Tracker',
+      title: 'Speed Tracker',
       theme: ThemeData.dark(),
       home: const CameraFrameScreen(),
     );
@@ -62,7 +69,7 @@ class _CameraFrameScreenState extends State<CameraFrameScreen> {
         Navigator.push(
           context,
           MaterialPageRoute(
-            builder: (context) => VideoPlayerScreen(videoFile: File(file.path)),
+            builder: (context) => VideoPlayerScreen(videoFile: File(file.path), isRecordedInApp: true),
           ),
         );
       }
@@ -88,18 +95,16 @@ class _CameraFrameScreenState extends State<CameraFrameScreen> {
           IconButton(
             icon: const Icon(Icons.photo_library),
             onPressed: () async {
-              final picker = ImagePicker();
-              final video = await picker.pickVideo(source: ImageSource.gallery);
-              if (video != null) {
-                if (!mounted) return;
+              final video = await ImagePicker().pickVideo(source: ImageSource.gallery);
+              if (video != null && context.mounted) {
                 Navigator.of(context).push(
                   MaterialPageRoute(
-                    builder: (context) => VideoPlayerScreen(videoFile: File(video.path)),
+                    builder: (context) => VideoPlayerScreen(videoFile: File(video.path), isRecordedInApp: false),
                   ),
                 );
               }
             },
-          )
+          ),
         ],
       ),
       body: Stack(
@@ -123,9 +128,18 @@ class _CameraFrameScreenState extends State<CameraFrameScreen> {
   }
 }
 
+// =============================================================================
+// VIDEO PLAYER & TRACKER SCREEN
+// =============================================================================
+
 class VideoPlayerScreen extends StatefulWidget {
   final File videoFile;
-  const VideoPlayerScreen({super.key, required this.videoFile});
+  final bool isRecordedInApp;
+  const VideoPlayerScreen({
+    super.key,
+    required this.videoFile,
+    this.isRecordedInApp = false,
+  });
   @override
   State<VideoPlayerScreen> createState() => _VideoPlayerScreenState();
 }
@@ -137,54 +151,61 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   bool _isInitialized = false;
   bool _isProcessing = false;
   bool _isSelectionMode = true;
+  bool _showGraphs = false;
+  bool _stopTrackingRequested = false;
+  bool _isSeeking = false;
+  bool _seekInFlight = false;
 
   Rect? _rect;
-  List<List<Offset>> _boundaries = [];
-  int? _selectedTraceIndex;
+  List<Offset> _boundaries = [];
 
-  final TextEditingController _l = TextEditingController(text: "1.0");
   final TextEditingController _h = TextEditingController(text: "1.0");
   final TextEditingController _fMM = TextEditingController(text: "26.0");
-  final TextEditingController _cx = TextEditingController();
-  final TextEditingController _cy = TextEditingController();
+  final TextEditingController _samInterval = TextEditingController(text: "1");
   String _calculationResult = "Define range, draw box, then track.";
 
   double _processingProgress = 0.0;
   int? _startTrackMs;
   int? _endTrackMs;
   Map<int, Rect> _trackedRects = {};
-  Map<int, List<List<Offset>>> _trackedBoundaries = {};
+  Map<int, List<Offset>> _trackedBoundaries = {};
   List<int> _sortedTrackedKeys = [];
-  bool _stopTrackingRequested = false;
-  bool _isSeeking = false;
-  bool _showGraphs = false;
-  double _avgTraceAspectRatio = 1.0;
-  bool _isSyncingInputs = false;
+  double _trackedFps = 30.0;
   final ValueNotifier<int> _uiPosition = ValueNotifier(0);
 
-  List<PhysicsPoint> _velocityData = [];
-  List<PhysicsPoint> _accelerationData = [];
+  List<PhysicsPoint> _speedData = [];
   List<PhysicsPoint> _posXData = [];
   List<PhysicsPoint> _posYData = [];
-  List<PhysicsPoint> _posZData = [];
-  List<Offset3D> _positionData = [];
+  List<PhysicsPoint> _absZData = [];
+  List<PhysicsPoint> _filteredPixelHeightData = [];
 
-  final HqSamTracer _tracer = HqSamTracer();
-  final OptiFlowTracker _flowTracker = OptiFlowTracker();
+  OrtSession? encoder;
+  OrtSession? decoder;
+  cv.Mat? template;
+  late Rect templateBox;
+
   final TransformationController _transformationController = TransformationController();
   final GlobalKey _videoKey = GlobalKey();
+
+  // ===========================================================================
+  // LIFECYCLE
+  // ===========================================================================
 
   @override
   void initState() {
     super.initState();
     _player.open(Media(widget.videoFile.path), play: false);
+    loadMobileSam();
 
-    _initAIModels();
-
-    _player.stream.tracks.listen((tracks) {
+    _player.stream.tracks.listen((_) {
       if (mounted && !_isInitialized) _initIntrinsics();
     });
-
+    _player.stream.width.listen((_) {
+      if (mounted) setState(() {});
+    });
+    _player.stream.height.listen((_) {
+      if (mounted) setState(() {});
+    });
     Future.delayed(const Duration(milliseconds: 1500)).then((_) {
       if (mounted && !_isInitialized) _initIntrinsics();
     });
@@ -192,68 +213,230 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     _player.stream.error.listen((error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Video Loading Error: $error"), backgroundColor: Colors.red),
+          SnackBar(content: Text("Video Error: $error"), backgroundColor: Colors.red),
         );
         setState(() => _isInitialized = true);
       }
     });
 
     _player.stream.position.listen((position) {
-      // ONLY update UI position if we are NOT currently scrubbing or processing
       if (!_isProcessing && !_isSeeking && mounted) {
         _uiPosition.value = position.inMilliseconds;
       }
     });
 
-    _l.addListener(() {
-      if (!_isSyncingInputs && _sortedTrackedKeys.isNotEmpty && _avgTraceAspectRatio > 0) {
-        _isSyncingInputs = true;
-        final val = double.tryParse(_l.text);
-        if (val != null) {
-          _h.text = (val / _avgTraceAspectRatio).toStringAsFixed(3);
-        }
-        _isSyncingInputs = false;
-      }
-      _calculatePhysicsGraphs();
-    });
-
-    _h.addListener(() {
-      if (!_isSyncingInputs && _sortedTrackedKeys.isNotEmpty && _avgTraceAspectRatio > 0) {
-        _isSyncingInputs = true;
-        final val = double.tryParse(_h.text);
-        if (val != null) {
-          _l.text = (val * _avgTraceAspectRatio).toStringAsFixed(3);
-        }
-        _isSyncingInputs = false;
-      }
-      _calculatePhysicsGraphs();
-    });
-
-    _fMM.addListener(_calculatePhysicsGraphs);
-    _cx.addListener(_calculatePhysicsGraphs);
-    _cy.addListener(_calculatePhysicsGraphs);
+    _h.addListener(calculate);
+    _fMM.addListener(calculate);
   }
 
-  Future<void> _initAIModels() async {
-    try {
-      await _tracer.loadMobileSam();
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Model Load Error: $e"), backgroundColor: Colors.red),
-        );
+  @override
+  void dispose() {
+    _player.dispose();
+    template?.dispose();
+    encoder?.release();
+    decoder?.release();
+    _transformationController.dispose();
+    _h.dispose();
+    _fMM.dispose();
+    _samInterval.dispose();
+    super.dispose();
+  }
+
+  // ===========================================================================
+  // NON-UI METHODS (AI TRACKING, MPV FRAME STEPPING & 3D PHYSICS)
+  // ===========================================================================
+
+  Future<void> loadMobileSam() async {
+    OrtEnv.instance.init();
+
+    final encoderBytes = await rootBundle.load('assets/mobile_sam.encoder.onnx');
+    final decoderBytes = await rootBundle.load('assets/mobile_sam.decoder.onnx');
+
+    encoder = OrtSession.fromBuffer(encoderBytes.buffer.asUint8List(), OrtSessionOptions());
+    decoder = OrtSession.fromBuffer(decoderBytes.buffer.asUint8List(), OrtSessionOptions());
+  }
+
+  List<Offset> getTrace(Uint8List bytes, Rect box, int width, int height) {
+    cv.Mat frame = cv.Mat.fromList(height, width, cv.MatType.CV_8UC4, bytes);
+    box = Rect.fromLTRB(
+      (box.center.dx - box.width * 0.6).clamp(0.0, 1.0),
+      (box.center.dy - box.height * 0.6).clamp(0.0, 1.0),
+      (box.center.dx + box.width * 0.6).clamp(0.0, 1.0),
+      (box.center.dy + box.height * 0.6).clamp(0.0, 1.0),
+    );
+
+    //10x square context area around bounding box
+    int cropSize = (max(box.width * width, box.height * height) * 10.0).round().clamp(2, min(width, height));
+
+    int cropX = (box.center.dx * width - cropSize / 2.0).round().clamp(0, width - cropSize);
+    int cropY = (box.center.dy * height - cropSize / 2.0).round().clamp(0, height - cropSize);
+
+    //resize to 1024x1024 and extract pixel rgb values
+    cv.VecMat channels = cv.split(cv.resize(frame.region(cv.Rect(cropX, cropY, cropSize, cropSize)), (1024, 1024)));
+    cv.Mat r = channels[0].convertTo(cv.MatType.CV_32FC1, alpha: 0.01712475, beta: -2.11790393);
+    cv.Mat g = channels[1].convertTo(cv.MatType.CV_32FC1, alpha: 0.017507, beta: -2.03571429);
+    cv.Mat b = channels[2].convertTo(cv.MatType.CV_32FC1, alpha: 0.01742919, beta: -1.80444444);
+
+    //setup input to encoder
+    Float32List input = Float32List(1 * 3 * 1024 * 1024);
+    input.setAll(0, r.data.buffer.asFloat32List());
+    input.setAll(1048576, g.data.buffer.asFloat32List());
+    input.setAll(2097152, b.data.buffer.asFloat32List());
+
+    for (cv.Mat c in channels) {
+      c.dispose();
+    }
+    r.dispose();
+    g.dispose();
+    b.dispose();
+
+    //run context window through encoder
+    OrtValueTensor inputTensor = OrtValueTensor.createTensorWithDataList(input, [1, 3, 1024, 1024]);
+    OrtValueTensor encoderOutputTensor = encoder!.run(OrtRunOptions(), {
+      encoder!.inputNames[0]: inputTensor
+    })[0] as OrtValueTensor;
+
+    //search region for decoder to find trace
+    Rect cropBox = Rect.fromLTRB(
+      (box.left * width - cropX) / cropSize * 1024.0,
+      (box.top * height - cropY) / cropSize * 1024.0,
+      (box.right * width - cropX) / cropSize * 1024.0,
+      (box.bottom * height - cropY) / cropSize * 1024.0,
+    );
+
+    //run decoder
+    // 0: encoder output
+    // 1: coordinates of points
+    // 2: labels of inputted points (2.0 = top left, 3.0 = bottom right)
+    // 3: previous mask (optional)
+    // 4: if previous mask is used (1.0 if used, 0.0 if not)
+    // 5: output mask size (directly scale back to original size)
+    List<OrtValue?> decoderOutput = decoder!.run(OrtRunOptions(), {
+      decoder!.inputNames[0]: encoderOutputTensor,
+      decoder!.inputNames[1]: OrtValueTensor.createTensorWithDataList(Float32List.fromList([cropBox.left, cropBox.top, cropBox.right, cropBox.bottom]), [1, 2, 2]),
+      decoder!.inputNames[2]: OrtValueTensor.createTensorWithDataList(Float32List.fromList([2.0, 3.0]), [1, 2]),
+      decoder!.inputNames[3]: OrtValueTensor.createTensorWithDataList(Float32List(256 * 256), [1, 1, 256, 256]),
+      decoder!.inputNames[4]: OrtValueTensor.createTensorWithDataList(Float32List(1), [1]),
+      decoder!.inputNames[5]: OrtValueTensor.createTensorWithDataList(Float32List.fromList([cropSize.toDouble(), cropSize.toDouble()]), [2]),
+    });
+    List<List<double>> confidenceData = ((decoderOutput[0] as OrtValueTensor).value as List)[0][0];
+
+    Uint8List binaryData = Uint8List(cropSize * cropSize);
+    for (int y = 0; y < cropSize; y++) {
+      for (int x = 0; x < cropSize; x++) {
+        // greater than 0.0 = in object
+        if (confidenceData[y][x] > 0.0) {
+          //make object white
+          binaryData[y * cropSize + x] = 255;
+        }
       }
     }
+
+    //trace outlines of white silhouettes
+    cv.VecVecPoint contours = cv.findContours(cv.Mat.fromList(cropSize, cropSize, cv.MatType.CV_8UC1, binaryData), cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE).$1;
+    if (contours.isEmpty) return [];
+    List<cv.VecPoint> sortedContours = List.generate(contours.length, (i) => contours[i])
+      ..sort((a, b) => cv.contourArea(b).compareTo(cv.contourArea(a)));
+
+    //take greatest area outline
+    cv.VecPoint bestContour = sortedContours.first;
+
+    return [
+      for (int j = 0; j < bestContour.length; j++)
+        Offset((bestContour[j].x + cropX).toDouble(), (bestContour[j].y + cropY).toDouble()),
+    ];
   }
 
-  void _initIntrinsics() {
+  void initTracker(Uint8List bytes, Rect rec, int width, int height) {
+    templateBox = rec;
+    //rec contains decimals between 0 and 1, represents relative location in image
+    int x = (rec.left * width).round().clamp(0, width - 2);
+    int y = (rec.top * height).round().clamp(0, height - 2);
+    int w = (rec.width * width).round().clamp(2, width - x);
+    int h = (rec.height * height).round().clamp(2, height - y);
+    //takes 2D template image from 1D bytes
+    template = cv.Mat.fromList(height, width, cv.MatType.CV_8UC4, bytes).region(cv.Rect(x, y, w, h));
+  }
+
+  Rect trackObject(Uint8List bytes, int width, int height) {
+    cv.Mat? nextFrame;
+    nextFrame = cv.Mat.fromList(height, width, cv.MatType.CV_8UC4, bytes);
+
+    //center of template box in the frame
+    double cx = templateBox.center.dx * width;
+    double cy = templateBox.center.dy * height;
+
+    //dimensions of search area
+    int searchW = (template!.cols * 5.0).ceil().clamp(0, width);
+    int searchH = (template!.rows * 5.0).ceil().clamp(0, height);
+
+    //top left of search area
+    int searchX = (cx - searchW / 2.0).round().clamp(0, width - searchW);
+    int searchY = (cy - searchH / 2.0).round().clamp(0, height - searchH);
+
+    cv.Mat searchArea = nextFrame.region(cv.Rect(searchX, searchY, searchW, searchH));
+
+    double bestConfidence = -1.0;
+    cv.Point? bestLoc;
+    double bestScale = 1.0;
+
+    for (double scale = 0.8; scale <= 1.2; scale += 0.1) {
+      int scaledW = (template!.cols * scale).round();
+      int scaledH = (template!.rows * scale).round();
+
+      if (scaledW >= searchArea.cols || scaledH >= searchArea.rows || scaledW < 2 || scaledH < 2) {
+        continue;
+      }
+
+      cv.Mat scaledTemplate = cv.resize(template!, (scaledW, scaledH));
+      //compare pixel brightness using cv.matchTemplate()
+      final mx = cv.minMaxLoc(cv.matchTemplate(searchArea, scaledTemplate, cv.TM_CCOEFF_NORMED));
+      if (mx.$2 > bestConfidence) {
+        bestConfidence = mx.$2;
+        bestLoc = mx.$4;
+        bestScale = scale;
+      }
+      scaledTemplate.dispose();
+    }
+
+    //convert template back to decimal between 0 and 1
+    templateBox = Rect.fromLTWH(
+      ((searchX + bestLoc!.x) / width).clamp(0.0, 1.0),
+      ((searchY + bestLoc.y) / height).clamp(0.0, 1.0),
+      (bestScale * template!.cols / width).clamp(0.0, 1.0),
+      (bestScale * template!.rows / height).clamp(0.0, 1.0),
+    );
+
+    nextFrame.dispose();
+    searchArea.dispose();
+    return templateBox;
+  }
+
+  Future<void> _initIntrinsics() async {
     if (_isInitialized) return;
     final double vidW = (_player.state.width ?? 0) > 0 ? _player.state.width!.toDouble() : 1280.0;
     final double vidH = (_player.state.height ?? 0) > 0 ? _player.state.height!.toDouble() : 720.0;
-    _cx.text = (vidW / 2).toStringAsFixed(1);
-    _cy.text = (vidH / 2).toStringAsFixed(1);
+
     _fMM.text = "26.0";
-    setState(() => _isInitialized = true);
+    if (widget.isRecordedInApp && Platform.isAndroid) {
+      try {
+        final Map<dynamic, dynamic>? hw = await const MethodChannel(
+          'com.example.speed_tracker/camera_intrinsics',
+        ).invokeMethod('getCameraIntrinsics', {
+          'videoPath': widget.videoFile.path,
+          'videoWidth': vidW.round(),
+          'videoHeight': vidH.round(),
+        });
+        if (hw != null) {
+          final double? hwF35 = (hw['focalLength35mm'] as num?)?.toDouble();
+          if (hwF35 != null && hwF35 > 5.0) _fMM.text = hwF35.toStringAsFixed(1);
+        }
+      } catch (e) {
+        debugPrint("Camera metadata extraction error: $e");
+      }
+    }
+
+    if (mounted) setState(() => _isInitialized = true);
   }
 
   void _resetAll() {
@@ -269,65 +452,54 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       _trackedRects = {};
       _trackedBoundaries = {};
       _sortedTrackedKeys = [];
-      _velocityData = [];
-      _accelerationData = [];
+      _speedData = [];
       _posXData = [];
       _posYData = [];
-      _posZData = [];
-      _positionData = [];
-      _selectedTraceIndex = null;
+      _absZData = [];
+      _filteredPixelHeightData = [];
       _uiPosition.value = 0;
       _processingProgress = 0.0;
       _calculationResult = "Define range, draw box, then track.";
     });
   }
 
-  @override
-  void dispose() {
-    _player.dispose();
-    _flowTracker.dispose();
-    _tracer.dispose();
-    _transformationController.dispose();
-    _l.dispose();
-    _h.dispose();
-    _fMM.dispose();
-    _cx.dispose();
-    _cy.dispose();
-    super.dispose();
+  Future<(Uint8List, int, int)?> _captureVideoFrame() async {
+    final boundary = _videoKey.currentContext?.findRenderObject() as RenderRepaintBoundary?;
+    if (boundary == null) return null;
+    final double ratio = (1280.0 / math.max(10.0, boundary.size.longestSide)).clamp(2.0, 4.0);
+    final ui.Image img = await boundary.toImage(pixelRatio: ratio);
+    final ByteData? bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+    final res = bd == null ? null : (bd.buffer.asUint8List(), img.width, img.height);
+    img.dispose();
+    return res;
   }
 
   Future<void> _traceFrame() async {
     if (_rect == null) return;
     setState(() => _isProcessing = true);
     try {
-      final boundary = _videoKey.currentContext?.findRenderObject() as RenderRepaintBoundary?;
-      if (boundary == null) return;
-      final image = await boundary.toImage(pixelRatio: 2.0);
-      final byteData = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
-      final bytes = byteData!.buffer.asUint8List();
-      final prep = _tracer.preprocessRaw(bytes, image.width, image.height);
-      List<List<Offset>> contours = await _tracer.extractMobileBoundaries(bytes, prep, roi: _rect!);
-      final normalized = contours
-          .map((poly) => poly
-          .map((p) => Offset(p.dx / prep.originalSize.width, p.dy / prep.originalSize.height))
-          .toList())
-          .toList();
+      final frame = await _captureVideoFrame();
+      if (frame == null) return;
+      final (bytes, width, height) = frame;
+      final contour = getTrace(bytes, _rect!, width, height);
       setState(() {
-        _boundaries = normalized;
-        _selectedTraceIndex = null;
-        
-        // Snap the manual selection box to the tight fit of the AI trace
-        if (contours.isNotEmpty && contours[0].isNotEmpty) {
-          _rect = _calculateTightRect(contours[0], image.width.toDouble(), image.height.toDouble(), scale: 1.0);
-        }
+        _boundaries = contour.map((p) => Offset(p.dx / width, p.dy / height)).toList();
+        if (contour.isNotEmpty) _rect = _calculateTightRect(contour, width.toDouble(), height.toDouble());
       });
-      prep.dispose();
-      image.dispose();
-    } catch (e) {
-      debugPrint("Trace Error: $e");
     } finally {
       setState(() => _isProcessing = false);
     }
+  }
+
+  bool _areFramesIdentical(Uint8List a, Uint8List b) {
+    if (a.length != b.length) return false;
+    final int step = math.max(4, (a.length ~/ 400) & ~3);
+    int diffSum = 0, count = 0;
+    for (int i = 0; i < a.length; i += step) {
+      diffSum += (a[i] - b[i]).abs();
+      count++;
+    }
+    return count > 0 && (diffSum / count) < 1.0;
   }
 
   Future<void> _startLocalCVTracking() async {
@@ -338,199 +510,93 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       _stopTrackingRequested = false;
       _trackedBoundaries.clear();
       _trackedRects.clear();
-      _sortedTrackedKeys = [];
+      _sortedTrackedKeys.clear();
       _processingProgress = 0.0;
-      _boundaries = []; // Clear manual trace before starting loop
+      _boundaries = [];
     });
 
     try {
       if (_player.state.playing) await _player.pause();
       final int startMs = _startTrackMs!, endMs = _endTrackMs!;
-      await _player.seek(Duration(milliseconds: startMs));
-      await Future.delayed(const Duration(milliseconds: 300));
+      _trackedFps = _player.state.track.video.fps ?? 30.0;
+      if (_trackedFps < 10.0) _trackedFps = 30.0;
+      final double frameStepMs = 1000.0 / _trackedFps;
+
+      if ((_player.state.position.inMilliseconds - startMs).abs() > 15) {
+        await _player.seek(Duration(milliseconds: startMs));
+        await Future.delayed(const Duration(milliseconds: 180));
+      }
+      await WidgetsBinding.instance.endOfFrame;
 
       Map<int, Rect> results = {};
-      Rect currentSearchBox = _rect!;
-      
-      // Clear out the tracking map keys list completely to ensure old data keys 
-      // do not corrupt the physics graph indexing.
-      _sortedTrackedKeys.clear();
+      Rect currentBox = _rect!;
+      int stepIndex = 0, framesSinceSam = 0;
+      Uint8List? prevBytes;
 
-      for (int t = startMs; t <= endMs; t += 33) {
-        if (!mounted || _stopTrackingRequested) break;
+      while (mounted && !_stopTrackingRequested) {
+        final int currentMs = (startMs + stepIndex * frameStepMs).round();
+        if (currentMs > endMs) break;
 
-        // Yield briefly to Flutter engine to keep UI responsive
-        setState(() => _processingProgress = (t - startMs) / (endMs - startMs));
-        await Future.delayed(const Duration(milliseconds: 5));
-
-        await _player.seek(Duration(milliseconds: t));
-        await Future.delayed(const Duration(milliseconds: 60));
-
-        final loopBoundary = _videoKey.currentContext?.findRenderObject() as RenderRepaintBoundary?;
-        if (loopBoundary == null) continue;
-
-        final actualMs = _player.state.position.inMilliseconds;
-        final loopImage = await loopBoundary.toImage(pixelRatio: 1.0);
-        final loopByteData = await loopImage.toByteData(format: ui.ImageByteFormat.rawRgba);
-
-        if (loopByteData == null) {
-          loopImage.dispose();
-          continue;
-        }
-
-        final loopBytes = loopByteData.buffer.asUint8List();
-
-        // 1. Get predicted location from Template Matching (fast localized tracking)
-        // If it's the very first frame, we skip running updateTracker since we already have 
-        // a manual search box or a pre-calculated trace from _traceFrame().
-        if (t == startMs) {
-          _flowTracker.initTracker(loopBytes, currentSearchBox, [], width: loopImage.width, height: loopImage.height);
-        }
-
-        // Get the real native player timestamp of this exact video frame to align indices perfectly
-        // (Removed duplicate actualMs variable declaration)
-
-        Rect predictedBox = (t == startMs)
-            ? currentSearchBox
-            : (_flowTracker.updateTracker(loopBytes, width: loopImage.width, height: loopImage.height) ?? currentSearchBox);
-
-        // Apply a 30% outer padding expansion onto the predictedBox ROI strictly when sending the prompt 
-        // down to MobileSAM. This provides the AI with contrast context without inflating templates or calculations.
-        // FIXED: Since MobileSAM's bounding box coordinate mapper expects a clean bounding format from the ROI 
-        // bounding box, padding it symmetrically around the center using Rect.fromCenter can accidentally shift 
-        // the top-left boundary into negative or unstable spaces during a bounce if the predictedBox size varies.
-        // We pad it safely using the standard inflation method to preserve local aspect anchors.
-        Rect paddedRoiForSam = Rect.fromLTRB(
-          predictedBox.left - predictedBox.width * 0.15,
-          predictedBox.top - predictedBox.height * 0.15,
-          predictedBox.right + predictedBox.width * 0.15,
-          predictedBox.bottom + predictedBox.height * 0.15,
-        );
-
-        // 2. Run MobileSAM ON EVERY FRAME for maximum proportional sizing & contour accuracy
-        final prep = _tracer.preprocessRaw(loopBytes, loopImage.width, loopImage.height);
-        try {
-          List<List<Offset>> contours = await _tracer.extractMobileBoundaries(loopBytes, prep, roi: paddedRoiForSam);
-
-          if (contours.isNotEmpty && contours[0].isNotEmpty) {
-            final normalized = contours.map((poly) => poly.map((p) =>
-                Offset(p.dx / prep.originalSize.width, p.dy / prep.originalSize.height)
-            ).toList()).toList();
-
-            // Keep the tracked baseline tightRect at exactly 1.0 scale to keep the recorded results 
-            // and the yellow UI box perfectly pinned to the purple contour line without drifting.
-            Rect tightRect = _calculateTightRect(contours[0], loopImage.width.toDouble(), loopImage.height.toDouble(), scale: 1.0);
-
-
-            // VELOCITY MOMENTUM GUARD: 
-            // SAM's result (tightRect) shouldn't be radically far from the 
-            // Template Matcher's prediction (predictedBox).
-            double predictedMoveDist = (predictedBox.center - currentSearchBox.center).distance;
-            double actualDeviation = (tightRect.center - predictedBox.center).distance;
-            
-            // Reverted back to the original generous bounce-friendly limit (1.5x predicted movement or min 8% screen)
-            // since the tight constraint was causing false rejections right at the sharp velocity switch frame.
-            double maxAllowedDeviation = math.max(0.08, predictedMoveDist * 1.5);
-            
-            if (actualDeviation > maxAllowedDeviation) {
-               debugPrint("SAM Wander Detected: $actualDeviation > $maxAllowedDeviation. Falling back to Template Match.");
-               Rect adjustedBox = Rect.fromLTWH(
-                 predictedBox.left,
-                 predictedBox.top,
-                 currentSearchBox.width,
-                 currentSearchBox.height,
-               );
-               results[actualMs] = adjustedBox;
-               _uiPosition.value = actualMs;
-               setState(() {
-                 _rect = adjustedBox;
-               });
-               currentSearchBox = adjustedBox;
-               _flowTracker.initTracker(loopBytes, adjustedBox, [], width: loopImage.width, height: loopImage.height);
-               continue; 
+        (Uint8List, int, int)? frame;
+        if (stepIndex == 0) {
+          frame = await _captureVideoFrame();
+        } else {
+          try {
+            await (_player.platform as dynamic).command(['frame-step']);
+          } catch (_) {
+            await _player.seek(Duration(milliseconds: currentMs));
+          }
+          for (int attempt = 0; attempt < 12; attempt++) {
+            await Future.delayed(const Duration(milliseconds: 35));
+            await WidgetsBinding.instance.endOfFrame;
+            frame = await _captureVideoFrame();
+            if (frame != null && (prevBytes == null || !_areFramesIdentical(frame.$1, prevBytes))) {
+              break;
             }
-
-            // Re-anchor Template Matching with the newly scaled bounds for the next frame
-            // We feed the exact uninflated tightRect into the tracker initialization so the template 
-            // remains perfectly cropped around the ball texture.
-            _flowTracker.initTracker(loopBytes, tightRect, normalized, width: loopImage.width, height: loopImage.height);
-
-            // However, we inflate currentSearchBox by a small scale factor ONLY when passing it down 
-            // as the ROI bounding box to MobileSAM on the next frame's decoder input.
-            currentSearchBox = tightRect;
-            results[actualMs] = tightRect;
-            _trackedBoundaries[actualMs] = normalized;
-
-            // Update progress notifier directly (no setState needed for the value)
-            _uiPosition.value = actualMs;
-
-            setState(() {
-              _rect = tightRect;
-            });
-          } else {
-            // Fallback gracefully to the predicted box if SAM misses a frame
-            Rect adjustedBox = Rect.fromLTWH(
-              predictedBox.left,
-              predictedBox.top,
-              currentSearchBox.width,
-              currentSearchBox.height,
-            );
-            results[actualMs] = adjustedBox;
-            _uiPosition.value = actualMs;
-            setState(() {
-              _rect = adjustedBox;
-            });
+            if (attempt == 6) {
+              await _player.seek(Duration(milliseconds: currentMs));
+            }
           }
-        } catch (e) {
-          debugPrint("SAM Error: $e");
-        } finally {
-          prep.dispose();
-          loopImage.dispose();
         }
-      }
 
-      // Physics Velocity Correction:
-      // The video player hardware seek operation (`_player.seek(...)`) takes a few milliseconds to settle. 
-      // During the first few iterations, `_player.state.position.inMilliseconds` often reports the EXACT same 
-      // timestamp (e.g. 1000ms followed by 1000ms again), which maps duplicate coordinates onto different frame intervals. 
-      // This artificially introduced a zero-displacement initial step that killed the initial velocity calculation.
-      // We explicitly enforce that the sequential tracking indices MUST increment monotonically.
-      final correctedResults = <int, Rect>{};
-      final correctedBoundaries = <int, List<List<Offset>>>{};
-      
-      int lastAddedMs = -9999;
-      final sortedKeys = results.keys.toList()..sort();
-      
-      for (int ms in sortedKeys) {
-        if (ms >= lastAddedMs + 15) { // Ensure at least a half-frame separation gap
-          correctedResults[ms] = results[ms]!;
-          if (_trackedBoundaries.containsKey(ms)) {
-            correctedBoundaries[ms] = _trackedBoundaries[ms]!;
+        if (frame == null) continue;
+        stepIndex++;
+        final (bytes, width, height) = frame;
+        prevBytes = bytes;
+
+        if (results.isNotEmpty) {
+          currentBox = trackObject(bytes, width, height);
+          framesSinceSam++;
+        }
+
+        final int samInterval = math.max(1, int.tryParse(_samInterval.text) ?? 1);
+        if (results.isEmpty || framesSinceSam >= samInterval) {
+          framesSinceSam = 0;
+          final contour = getTrace(bytes, currentBox, width, height);
+          if (contour.isNotEmpty) {
+            _trackedBoundaries[currentMs] = contour.map((p) => Offset(p.dx / width, p.dy / height)).toList();
+            currentBox = _calculateTightRect(contour, width.toDouble(), height.toDouble());
           }
-          lastAddedMs = ms;
+          initTracker(bytes, currentBox, width, height);
         }
-      }
 
-      if (correctedResults.isEmpty) throw Exception("Object lost immediately. No unique frames tracked.");
+        results[currentMs] = currentBox;
+        _uiPosition.value = currentMs;
+        setState(() {
+          _rect = currentBox;
+          _processingProgress = ((currentMs - startMs) / math.max(1, endMs - startMs)).clamp(0.0, 1.0);
+        });
+      }
 
       setState(() {
-        _trackedRects = correctedResults;
-        _trackedBoundaries = correctedBoundaries;
-        _sortedTrackedKeys = correctedResults.keys.toList()..sort();
-        _calculatePhysicsGraphs();
+        _rect = null;
+        _trackedRects = results;
+        _sortedTrackedKeys = results.keys.toList()..sort();
       });
+      calculate();
 
       await _player.seek(Duration(milliseconds: startMs));
-    } catch (e) {
-      debugPrint("Tracking Pipeline Error: $e");
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text("Error: $e"),
-            backgroundColor: Colors.redAccent,
-          ),
-        );
-      }
+      _uiPosition.value = startMs;
     } finally {
       if (mounted) setState(() => _isProcessing = false);
     }
@@ -545,179 +611,148 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       maxX = math.max(maxX, p.dx);
       maxY = math.max(maxY, p.dy);
     }
-    double curW = maxX - minX, curH = maxY - minY;
-    
-    // Scale the tight boundaries directly without forcing the original box's aspect ratio constraint
-    double finalW = curW * scale;
-    double finalH = curH * scale;
-    
     return Rect.fromCenter(
-      center: Offset((minX + curW / 2) / width, (minY + curH / 2) / height),
-      width: finalW / width,
-      height: finalH / height,
+      center: Offset((minX + maxX) / 2.0 / width, (minY + maxY) / 2.0 / height),
+      width: (maxX - minX) * scale / width,
+      height: (maxY - minY) * scale / height,
     );
   }
 
-  void _calculatePhysicsGraphs() {
-    final double? pW = double.tryParse(_l.text);
-    final double? pH = double.tryParse(_h.text);
-    final double? fMM = double.tryParse(_fMM.text);
-    final double? cx = double.tryParse(_cx.text);
-    final double? cy = double.tryParse(_cy.text);
+  void calculate() {
+    double? objectHeight = double.tryParse(_h.text);
+    double? fMM = double.tryParse(_fMM.text);
+    int n = _sortedTrackedKeys.length;
+    if (objectHeight == null || fMM == null || n < 3) return;
 
-    if (pW == null || pH == null || fMM == null || cx == null || cy == null || _sortedTrackedKeys.length < 2) {
-      return;
+    double vidW = (_player.state.width ?? 0) > 0 ? _player.state.width!.toDouble() : 1280.0;
+    double vidH = (_player.state.height ?? 0) > 0 ? _player.state.height!.toDouble() : 720.0;
+
+    double cx = vidW / 2.0;
+    double cy = vidH / 2.0;
+
+    //pixel focal length
+    double fPx = (fMM / 36.0) * math.max(vidW, vidH);
+
+    double dt = 1.0 / (_trackedFps > 0 ? _trackedFps : 30.0);
+    double t0 = _sortedTrackedKeys.first / 1000.0;
+
+    //object locations
+    List<Offset> centers = [
+      for (int ms in _sortedTrackedKeys) Offset(_trackedRects[ms]!.center.dx * vidW, _trackedRects[ms]!.center.dy * vidH)
+    ];
+
+    List<double> times = List.generate(n, (i) => t0 + i * dt);
+    List<double> filteredPixH = filterPixelHeight([for (final ms in _sortedTrackedKeys) _trackedRects[ms]!.height * vidH]);
+
+    //calculate 3d position
+    List<double> x = [], y = [], z = [];
+    for (int i = 0; i < n; i++) {
+      double metersPerPx = objectHeight / filteredPixH[i];
+      x.add((centers[i].dx - cx) * metersPerPx);
+      y.add((cy - centers[i].dy) * metersPerPx);
+      z.add(fPx * metersPerPx);
     }
 
-    final double vidW = (_player.state.width ?? 0) > 0 ? _player.state.width!.toDouble() : 1280.0;
-    final double vidH = (_player.state.height ?? 0) > 0 ? _player.state.height!.toDouble() : 720.0;
-    final double fx = (fMM / 36.0) * vidW, fy = fx;
-
-    double totalRatio = 0;
-    int ratioCount = 0;
-    for (var frameContours in _trackedBoundaries.values) {
-      if (frameContours.isNotEmpty) {
-        final poly = frameContours[0];
-        if (poly.isEmpty) continue;
-        double minX = poly[0].dx, minY = poly[0].dy, maxX = poly[0].dx, maxY = poly[0].dy;
-        for (final p in poly) {
-          minX = math.min(minX, p.dx);
-          minY = math.min(minY, p.dy);
-          maxX = math.max(maxX, p.dx);
-          maxY = math.max(maxY, p.dy);
-        }
-        double wPixels = (maxX - minX) * vidW;
-        double hPixels = (maxY - minY) * vidH;
-        if (wPixels > 0 && hPixels > 0) {
-          totalRatio += wPixels / hPixels;
-          ratioCount++;
-        }
-      }
-    }
-    if (ratioCount > 0 && !_isSyncingInputs) _avgTraceAspectRatio = totalRatio / ratioCount;
-
-    List<Offset3D> positions = [];
-    List<double> times = [];
-    for (int ms in _sortedTrackedKeys) {
-      double pixW, pixH, cX, cY;
-      if (_trackedBoundaries.containsKey(ms) && _trackedBoundaries[ms]!.isNotEmpty) {
-        final poly = _trackedBoundaries[ms]![0];
-        double minX = poly[0].dx, minY = poly[0].dy, maxX = poly[0].dx, maxY = poly[0].dy;
-        for (final p in poly) {
-          minX = math.min(minX, p.dx);
-          minY = math.min(minY, p.dy);
-          maxX = math.max(maxX, p.dx);
-          maxY = math.max(maxY, p.dy);
-        }
-        pixW = (maxX - minX) * vidW;
-        pixH = (maxY - minY) * vidH;
-        cX = (minX + (maxX - minX) / 2) * vidW;
-        cY = (minY + (maxY - minY) / 2) * vidH;
-      } else {
-        final r = _trackedRects[ms]!;
-        pixW = r.width * vidW;
-        pixH = r.height * vidH;
-        cX = r.center.dx * vidW;
-        cY = r.center.dy * vidH;
-      }
-      final double z = ((fx * pW) / pixW + (fy * pH) / pixH) / 2.0;
-      
-      // INVERSION CORRECTION: Standard digital image coordinates have (0,0) at the Top-Left corner.
-      // This means as an object moves physically DOWN (decreasing height/altitude), its 'cY' screen pixel index 
-      // increases. We subtract cY from the camera height midpoint (cy) to align with standard physical Cartesian 
-      // coordinates where upwards movement represents positive Y delta.
-      positions.add(Offset3D((cX - cx) * z / fx, (cy - cY) * z / fy, z));
-      times.add(ms / 1000.0);
+    //speed calculation using pythagorean theorem
+    List<double> speeds = [];
+    for (int i = 1; i < n; i++) {
+      double dx = x[i] - x[i - 1];
+      double dy = y[i] - y[i - 1];
+      double dz = z[i] - z[i - 1];
+      speeds.add(math.sqrt(dx * dx + dy * dy + dz * dz) / dt);
     }
 
-    List<Offset3D> sPos = [];
-    for (int i = 0; i < positions.length; i++) {
-      int s = math.max(0, i - 2), e = math.min(positions.length - 1, i + 2);
-      double sx = 0, sy = 0, sz = 0;
-      for (int j = s; j <= e; j++) {
-        sx += positions[j].x;
-        sy += positions[j].y;
-        sz += positions[j].z;
-      }
-      sPos.add(Offset3D(sx / (e - s + 1), sy / (e - s + 1), sz / (e - s + 1)));
+    _updateGraphs(times, filteredPixH, x, y, z, speeds);
+  }
+
+  List<double> filterPixelHeight(List<double> rawPixH) {
+    int n = rawPixH.length;
+
+    //median filter to remove spikes
+    List<double> medPixH = [];
+    medPixH.add(rawPixH[0]);
+    for(int i = 1; i < n - 1; i++){
+      List<double> window = [rawPixH[i - 1], rawPixH[i], rawPixH[i + 1]]..sort();
+      medPixH.add(window[1]);
+    }
+    medPixH.add(rawPixH[n - 1]);
+
+    //for inverse quadratic, flip first and take quadratic regression
+    List<double> invPixH = [for (double h in medPixH) 1.0 / h];
+
+    //normalize times
+    List<double> t = [for (int i = 0; i < n; i++) i / (n - 1)];
+
+    double sumT0 = 0.0, sumT1 = 0.0, sumT2 = 0.0, sumT3 = 0.0, sumT4 = 0.0, sumHT0 = 0.0, sumHT1 = 0.0, sumHT2 = 0.0;
+    //initialize known values
+    for(int i = 0; i < n; i++){
+      sumT0++;
+      sumT1 += t[i];
+      sumT2 += t[i] * t[i];
+      sumT3 += t[i] * t[i] * t[i];
+      sumT4 += t[i] * t[i] * t[i] * t[i];
+      sumHT0 += invPixH[i];
+      sumHT1 += invPixH[i] * t[i];
+      sumHT2 += invPixH[i] * t[i] * t[i];
     }
 
-    List<PhysicsPoint> rawVData = [];
-    for (int i = 1; i < sPos.length; i++) {
-      final dv = sPos[i].distanceTo(sPos[i - 1]), dt = times[i] - times[i - 1];
-      if (dt > 0) {
-        double instantV = dv / dt;
-        if (instantV < 112.0) rawVData.add(PhysicsPoint(times[i], instantV));
-      }
+    List<List<double>> mat = [
+      [sumT0, sumT1, sumT2],
+      [sumT1, sumT2, sumT3],
+      [sumT2, sumT3, sumT4],
+    ];
+
+    List<List<double>> A = [
+      [sumHT0, sumT1, sumT2],
+      [sumHT1, sumT2, sumT3],
+      [sumHT2, sumT3, sumT4],
+    ];
+
+    List<List<double>> B = [
+      [sumT0, sumHT0, sumT2],
+      [sumT1, sumHT1, sumT3],
+      [sumT2, sumHT2, sumT4],
+    ];
+
+    List<List<double>> C = [
+      [sumT0, sumT1, sumHT0],
+      [sumT1, sumT2, sumHT1],
+      [sumT2, sumT3, sumHT2],
+    ];
+
+    //3D determinant
+    double det3D(List<List<double>> m) {
+      return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+          - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+          + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
     }
 
-    // Velocity Smoothing: 5-point moving average to eliminate derivative noise (pixel jitter)
-    List<PhysicsPoint> vData = [];
-    for (int i = 0; i < rawVData.length; i++) {
-      int s = math.max(0, i - 2), e = math.min(rawVData.length - 1, i + 2);
-      double sumV = 0;
-      for (int j = s; j <= e; j++) sumV += rawVData[j].value;
-      vData.add(PhysicsPoint(rawVData[i].time, sumV / (e - s + 1)));
-    }
+    double a = det3D(A) / det3D(mat);
+    double b = det3D(B) / det3D(mat);
+    double c = det3D(C) / det3D(mat);
 
-    // Acceleration Smoothing: Derived from smoothed velocity, then smoothed again
-    List<PhysicsPoint> rawAData = [];
-    for (int i = 1; i < vData.length; i++) {
-      final dv = vData[i].value - vData[i - 1].value, dt = vData[i].time - vData[i - 1].time;
-      if (dt > 0) rawAData.add(PhysicsPoint(vData[i].time, dv / dt));
-    }
-
-    List<PhysicsPoint> aData = [];
-    for (int i = 0; i < rawAData.length; i++) {
-      int s = math.max(0, i - 2), e = math.min(rawAData.length - 1, i + 2);
-      double sumA = 0;
-      for (int j = s; j <= e; j++) sumA += rawAData[j].value;
-      aData.add(PhysicsPoint(rawAData[i].time, sumA / (e - s + 1)));
-    }
-
-    List<PhysicsPoint> xData = [], yData = [], zData = [];
-    for (int i = 0; i < positions.length; i++) {
-      xData.add(PhysicsPoint(times[i], positions[i].x));
-      yData.add(PhysicsPoint(times[i], positions[i].y));
-      zData.add(PhysicsPoint(times[i], positions[i].z));
-    }
-
-    setState(() {
-      _velocityData = vData;
-      _accelerationData = aData;
-      _posXData = xData;
-      _posYData = yData;
-      _posZData = zData;
-      _positionData = sPos; // Use smoothed path for 3D visualization
-      if (vData.isNotEmpty) {
-        double totalD = 0;
-        // Use smoothed positions for average to remove distance added by pixel jitter
-        for (int i = 1; i < sPos.length; i++) totalD += sPos[i].distanceTo(sPos[i - 1]);
-        final pAvgV = totalD / (times.last - times.first);
-        final peakV = vData.map((e) => e.value).reduce(math.max);
-        _calculationResult =
-        "Avg: ${(pAvgV * 2.23694).toStringAsFixed(1)} mph | Peak: ${(peakV * 2.23694).toStringAsFixed(1)} mph";
-      } else {
-        _calculationResult = "Track object to see speed";
-      }
-    });
+    return [for (int i = 0; i < n; i++) 1.0 / (a + b * t[i] + c * t[i] * t[i])];
   }
 
   int? _getClosestTrackedKey(int currentMs) {
     if (_sortedTrackedKeys.isEmpty) return null;
-    int? tB;
+    int? bestKey;
+    int bestDiff = 999999;
     for (int key in _sortedTrackedKeys) {
-      if (key <= currentMs) {
-        tB = key;
-      } else {
-        break;
+      final int diff = (key - currentMs).abs();
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestKey = key;
       }
     }
-    return tB ?? _sortedTrackedKeys.first;
+    return bestKey;
   }
 
   Rect? _getCurrentFrameRect(int currentMs) {
     if (_trackedRects.isEmpty || _sortedTrackedKeys.isEmpty) return null;
+    if (currentMs <= _sortedTrackedKeys.first) return _trackedRects[_sortedTrackedKeys.first];
+    if (currentMs >= _sortedTrackedKeys.last) return _trackedRects[_sortedTrackedKeys.last];
+
     int? tB, tA;
     for (int ms in _sortedTrackedKeys) {
       if (ms <= currentMs) {
@@ -728,7 +763,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       }
     }
     if (tB == null) return _trackedRects[_sortedTrackedKeys.first];
-    if (tA == null) return _trackedRects[tB];
+    if (tA == null || tA == tB) return _trackedRects[tB];
     final double r = (currentMs - tB) / (tA - tB);
     final rB = _trackedRects[tB]!, rA = _trackedRects[tA]!;
     return Rect.fromLTRB(
@@ -739,455 +774,44 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Speed Tracker Tracer'), actions: _buildAppBarActions()),
-      backgroundColor: Colors.black,
-      body: !_isInitialized
-          ? const Center(child: CircularProgressIndicator())
-          : Column(
-        children: [
-          Expanded(
-            child: _showGraphs
-                ? _buildGraphPanel()
-                : _buildFrame(_controller, _videoKey, _rect, _boundaries, _l, _h),
-          ),
-          if (_isProcessing)
-            LinearProgressIndicator(value: _processingProgress, color: Colors.purpleAccent),
-          if (!_showGraphs) _buildMeasurementToolbar(),
-          _buildResultPanel(),
-        ],
-      ),
+  // ===========================================================================
+  // UI METHODS (GRAPH DATA UPDATES, FORMATTING & WIDGET BUILDERS)
+  // ===========================================================================
+
+  void _updateGraphs(
+    List<double> times,
+    List<double> filteredPixH,
+    List<double> x,
+    List<double> y,
+    List<double> z,
+    List<double> speeds,
+  ) {
+    final int n = z.length;
+    final List<PhysicsPoint> speedData = List.generate(
+      speeds.length,
+      (i) => PhysicsPoint(0.5 * (times[i] + times[i + 1]), speeds[i]),
     );
-  }
+    final List<PhysicsPoint> xData = List.generate(n, (i) => PhysicsPoint(times[i], x[i] - x.first));
+    final List<PhysicsPoint> yData = List.generate(n, (i) => PhysicsPoint(times[i], y[i] - y.first));
+    final List<PhysicsPoint> absZData = List.generate(n, (i) => PhysicsPoint(times[i], z[i]));
+    final List<PhysicsPoint> filtPixHData = List.generate(n, (i) => PhysicsPoint(times[i], filteredPixH[i]));
 
-  List<Widget> _buildAppBarActions() {
-    return [
-      Container(
-        margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
-        decoration: BoxDecoration(
-          color: _isSelectionMode ? Colors.purpleAccent : Colors.transparent,
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: IconButton(
-          icon: const Icon(Icons.edit),
-          tooltip: "Selection Mode",
-          onPressed: () => setState(() => _isSelectionMode = true),
-        ),
-      ),
-      Container(
-        margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
-        decoration: BoxDecoration(
-          color: !_isSelectionMode ? Colors.blueAccent : Colors.transparent,
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: IconButton(
-          icon: const Icon(Icons.zoom_in),
-          tooltip: "Zoom Mode",
-          onPressed: () => setState(() => _isSelectionMode = false),
-        ),
-      ),
-      Container(
-        margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
-        decoration: BoxDecoration(
-          color: _showGraphs ? Colors.greenAccent : Colors.transparent,
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: IconButton(
-          icon: Icon(_showGraphs ? Icons.video_library : Icons.bar_chart),
-          tooltip: _showGraphs ? "View Video" : "View Graphs",
-          onPressed: () => setState(() => _showGraphs = !_showGraphs),
-        ),
-      ),
-      const SizedBox(width: 8),
-    ];
-  }
-
-  Widget _buildMeasurementToolbar() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-      color: Colors.black,
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-        children: [
-          TextButton.icon(
-            onPressed: () => setState(() => _startTrackMs = _player.state.position.inMilliseconds),
-            icon: Icon(
-              Icons.start,
-              color: _startTrackMs != null ? Colors.greenAccent : Colors.white54,
-              size: 16,
-            ),
-            label: Text(
-              _startTrackMs == null
-                  ? "Set Start"
-                  : "Start: ${_formatDuration(Duration(milliseconds: _startTrackMs!))}",
-              style: const TextStyle(fontSize: 10),
-            ),
-          ),
-          TextButton.icon(
-            onPressed: () => setState(() => _endTrackMs = _player.state.position.inMilliseconds),
-            icon: Icon(
-              Icons.output,
-              color: _endTrackMs != null ? Colors.redAccent : Colors.white54,
-              size: 16,
-            ),
-            label: Text(
-              _endTrackMs == null
-                  ? "Set End"
-                  : "End: ${_formatDuration(Duration(milliseconds: _endTrackMs!))}",
-              style: const TextStyle(fontSize: 10),
-            ),
-          ),
-          IconButton(
-            icon: const Icon(Icons.refresh, color: Colors.white54, size: 20),
-            onPressed: _resetAll,
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildFrame(
-      VideoController c,
-      GlobalKey key,
-      Rect? r,
-      List<List<Offset>> b,
-      TextEditingController l,
-      TextEditingController h,
-      ) {
-    return Column(
-      children: [
-        Expanded(
-          child: Stack(children: [
-            InteractiveViewer(
-              transformationController: _transformationController,
-              panEnabled: !_isSelectionMode,
-              scaleEnabled: !_isSelectionMode,
-              minScale: 1.0,
-              maxScale: 40.0,
-              clipBehavior: Clip.none,
-              boundaryMargin: const EdgeInsets.all(double.infinity),
-              child: Center(
-                child: AspectRatio(
-                  aspectRatio: ((_player.state.width ?? 0) > 0 && (_player.state.height ?? 0) > 0)
-                      ? _player.state.width! / _player.state.height!
-                      : 16 / 9,
-                  child: IgnorePointer(
-                    ignoring: !_isSelectionMode,
-                    child: RectangleSelector(
-                      rect: _rect,
-                      enabled: _isSelectionMode,
-                      onChanged: (nR) => setState(() {
-                        _rect = nR;
-                        if (nR != null) {
-                          _selectedTraceIndex = null;
-                          _trackedRects.clear();
-                        }
-                      }),
-                      onTapTrace: (idx) => setState(() =>
-                      _selectedTraceIndex = (_selectedTraceIndex == idx) ? null : idx),
-                      tracePoints: _boundaries,
-                      child: Stack(children: [
-                        RepaintBoundary(
-                          key: _videoKey,
-                          child: Video(controller: c, controls: NoVideoControls),
-                        ),
-                        ValueListenableBuilder(
-                          valueListenable: _uiPosition,
-                          builder: (context, ms, child) {
-                            final aR = _getCurrentFrameRect(ms);
-                            final cK = _getClosestTrackedKey(ms);
-                            final fB = (cK != null) ? _trackedBoundaries[cK] : null;
-                            return Stack(children: [
-                              if (_sortedTrackedKeys.isNotEmpty)
-                                Positioned.fill(
-                                  child: CustomPaint(
-                                    size: Size.infinite,
-                                    painter: TrajectoryPainter(_trackedRects, _sortedTrackedKeys, ms),
-                                  ),
-                                ),
-                              if (aR != null)
-                                Positioned.fill(
-                                  child: CustomPaint(
-                                    size: Size.infinite,
-                                    painter: _RectPainter(aR, color: Colors.cyanAccent, thickness: 4.0),
-                                  ),
-                                ),
-                              if (fB != null)
-                                Positioned.fill(
-                                  child: CustomPaint(
-                                    size: Size.infinite,
-                                    painter: BoundaryPainter(fB),
-                                  ),
-                                ),
-                            ]);
-                          },
-                        ),
-                        if (_boundaries.isNotEmpty)
-                          CustomPaint(
-                            painter: BoundaryPainter(_boundaries, selectedIndex: _selectedTraceIndex),
-                            size: Size.infinite,
-                          ),
-                      ]),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-            Positioned(
-              top: 8,
-              left: 8,
-              child: Row(children: [
-                CircleAvatar(
-                  backgroundColor: Colors.black54,
-                  child: IconButton(
-                    icon: _isProcessing
-                        ? const SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                    )
-                        : const Icon(Icons.psychology, color: Colors.white),
-                    tooltip: "Refine Trace",
-                    onPressed: _isProcessing ? null : () => _traceFrame(),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                CircleAvatar(
-                  backgroundColor: Colors.black54,
-                  child: IconButton(
-                    icon: _isProcessing
-                        ? const Icon(Icons.pause, color: Colors.orangeAccent)
-                        : const Icon(Icons.track_changes, color: Colors.cyanAccent),
-                    tooltip: _isProcessing ? "Stop Tracking" : "Start CV Tracking",
-                    onPressed: _isProcessing
-                        ? () => setState(() => _stopTrackingRequested = true)
-                        : () => _startLocalCVTracking(),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                if (_boundaries.isNotEmpty || _trackedRects.isNotEmpty || _startTrackMs != null)
-                  CircleAvatar(
-                    backgroundColor: Colors.black54,
-                    child: IconButton(
-                      icon: const Icon(Icons.layers_clear, color: Colors.redAccent),
-                      onPressed: _resetAll,
-                    ),
-                  ),
-              ]),
-            ),
-          ]),
-        ),
-        _buildScrubber(),
-        _buildDimensionInputs(_l, _h, "Reference Object Size"),
-      ],
-    );
-  }
-
-  Widget _buildGraphPanel() {
-    if (_velocityData.isEmpty) {
-      return const Center(
-        child: Text("No physics data yet.", style: TextStyle(color: Colors.white54)),
-      );
-    }
-    return Container(
-      color: Colors.black,
-      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 20),
-      child: Column(children: [
-        Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-          const Text(
-            "PHYSICS DASHBOARD",
-            style: TextStyle(
-              fontSize: 20,
-              fontWeight: FontWeight.w900,
-              color: Colors.cyanAccent,
-              letterSpacing: 1.2,
-            ),
-          ),
-          IconButton(
-            icon: const Icon(Icons.close, color: Colors.white54),
-            onPressed: () => setState(() => _showGraphs = false),
-          ),
-        ]),
-        Expanded(
-          child: SingleChildScrollView(
-            child: Column(children: [
-              const SizedBox(height: 20),
-              _build3DTrajectoryView(),
-              const SizedBox(height: 30),
-              _buildGraphGroup("3D POSITION VECTORS (Meters)", [
-                _buildGraph("X - Horizontal", _posXData, Colors.redAccent),
-                _buildGraph("Y - Vertical", _posYData, Colors.greenAccent),
-                _buildGraph("Z - Depth", _posZData, Colors.blueAccent),
-              ]),
-              const SizedBox(height: 30),
-              _buildGraphGroup("MOTION DYNAMICS", [
-                _buildGraph("Velocity (m/s)", _velocityData, Colors.cyanAccent),
-                _buildGraph("Acceleration (m/s²)", _accelerationData, Colors.orangeAccent),
-              ]),
-              const SizedBox(height: 30),
-              _buildIntrinsicsEditor(),
-              const SizedBox(height: 30),
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.05),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Column(children: [
-                  const Text(
-                    "AVERAGE SPEED",
-                    style: TextStyle(fontSize: 12, color: Colors.white38, fontWeight: FontWeight.bold),
-                  ),
-                  Text(
-                    _calculationResult,
-                    style: const TextStyle(
-                      fontSize: 28,
-                      color: Colors.greenAccent,
-                      fontWeight: FontWeight.w900,
-                    ),
-                  ),
-                ]),
-              ),
-              const SizedBox(height: 20),
-              ElevatedButton.icon(
-                onPressed: () => setState(() => _showGraphs = false),
-                icon: const Icon(Icons.video_library),
-                label: const Text("RETURN TO VIDEO"),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.cyan.shade900,
-                  minimumSize: const Size(double.infinity, 50),
-                ),
-              ),
-              const SizedBox(height: 20),
-            ]),
-          ),
-        ),
-      ]),
-    );
-  }
-
-  Widget _build3DTrajectoryView() {
-    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      const Text(
-        "3D SPATIAL RECONSTRUCTION",
-        style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white38, letterSpacing: 1.1),
-      ),
-      const SizedBox(height: 12),
-      const Text("Swipe to rotate view", style: TextStyle(fontSize: 9, color: Colors.white24)),
-      const SizedBox(height: 8),
-      ThreeDTrajectoryView(points: _positionData),
-    ]);
-  }
-
-  Widget _buildIntrinsicsEditor() {
-    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      const Text(
-        "CAMERA INTRINSIC PARAMETERS (Testing)",
-        style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white38, letterSpacing: 1.1),
-      ),
-      const SizedBox(height: 12),
-      Row(children: [
-        Expanded(child: _buildSmallInput("f (mm)", _fMM)),
-        const SizedBox(width: 8),
-        Expanded(child: _buildSmallInput("cx", _cx)),
-        const SizedBox(width: 8),
-        Expanded(child: _buildSmallInput("cy", _cy)),
-      ]),
-    ]);
-  }
-
-  Widget _buildSmallInput(String l, TextEditingController c) {
-    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Text(l, style: const TextStyle(fontSize: 9, color: Colors.white24)),
-      TextField(
-        controller: c,
-        decoration: const InputDecoration(isDense: true, contentPadding: EdgeInsets.symmetric(vertical: 8)),
-        style: const TextStyle(fontSize: 11, color: Colors.white70),
-        keyboardType: TextInputType.number,
-      )
-    ]);
-  }
-
-  Widget _buildGraphGroup(String t, List<Widget> g) {
-    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Text(t, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white38, letterSpacing: 1.1)),
-      const SizedBox(height: 12),
-      ...g.map((w) => Padding(padding: const EdgeInsets.only(bottom: 12), child: SizedBox(height: 100, child: w))),
-    ]);
-  }
-
-  Widget _buildScrubber() {
-    return StreamBuilder<Duration>(
-      stream: _player.stream.duration,
-      builder: (context, snapshot) {
-        // Fallback to player state if stream hasn't emitted yet
-        final Duration duration = snapshot.data ?? _player.state.duration;
-        double max = duration.inMilliseconds.toDouble();
-        if (max <= 0) max = 100.0; // Temporary default
-        
-        return Container(
-          color: Colors.grey.shade900,
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-          child: Row(children: [
-            IconButton(
-              icon: Icon(_player.state.playing ? Icons.pause : Icons.play_arrow),
-              onPressed: () => setState(() => _player.state.playing ? _player.pause() : _player.play()),
-            ),
-            Expanded(
-              child: ValueListenableBuilder(
-                valueListenable: _uiPosition,
-                builder: (context, ms, child) {
-                  // If duration isn't loaded yet, but we have a position, push 'max' out
-                  double sliderMax = max;
-                  if (ms.toDouble() > max) {
-                    sliderMax = ms.toDouble() + 1000.0;
-                  }
-                  
-                  final bool isLoaded = max > 100.0; // Assume >100ms means real metadata loaded
-
-                  return SliderTheme(
-                    data: SliderTheme.of(context).copyWith(
-                      trackHeight: 4,
-                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
-                      activeTrackColor: isLoaded ? Colors.purpleAccent : Colors.grey,
-                      inactiveTrackColor: Colors.white24,
-                      thumbColor: isLoaded ? Colors.purpleAccent : Colors.grey,
-                    ),
-                    child: Slider(
-                      value: ms.toDouble().clamp(0, sliderMax),
-                      min: 0,
-                      max: sliderMax,
-                      divisions: (sliderMax > 0) ? (sliderMax / 10).round().clamp(1, 1000) : 1,
-                      onChanged: isLoaded ? (nV) {
-                        final tMs = nV.toInt();
-                        _uiPosition.value = tMs;
-                        if (!_isSeeking) {
-                          _isSeeking = true;
-                          _player.seek(Duration(milliseconds: tMs)).then((_) {
-                            if (mounted) {
-                              setState(() => _isSeeking = false);
-                            }
-                          });
-                        }
-                      } : null,
-                    ),
-                  );
-                },
-              ),
-            ),
-            ValueListenableBuilder(
-              valueListenable: _uiPosition,
-              builder: (context, ms, child) => Text(
-                _formatDuration(Duration(milliseconds: ms)),
-                style: const TextStyle(color: Colors.white70, fontSize: 10, fontFamily: 'monospace'),
-              ),
-            ),
-          ]),
-        );
-      },
-    );
+    setState(() {
+      _speedData = speedData;
+      _posXData = xData;
+      _posYData = yData;
+      _absZData = absZData;
+      _filteredPixelHeightData = filtPixHData;
+      if (speeds.isNotEmpty && times.last > times.first) {
+        final double avgSpeed = speeds.reduce((a, b) => a + b) / speeds.length;
+        final double peakSpeed = speeds.reduce(math.max);
+        _calculationResult =
+            "Avg: ${(avgSpeed * 2.23694).toStringAsFixed(1)} mph (${(avgSpeed * 3.6).toStringAsFixed(1)} kph) | "
+            "Peak: ${(peakSpeed * 2.23694).toStringAsFixed(1)} mph (${(peakSpeed * 3.6).toStringAsFixed(1)} kph)";
+      } else {
+        _calculationResult = "Track object to see speed";
+      }
+    });
   }
 
   String _formatDuration(Duration d) {
@@ -1195,100 +819,440 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     return "${tD(d.inMinutes.remainder(60))}:${tD(d.inSeconds.remainder(60))}.${d.inMilliseconds.remainder(1000).toString().padLeft(3, '0')}";
   }
 
-  Widget _buildDimensionInputs(TextEditingController l, TextEditingController h, String lbl) {
+  String _formatSpeedStats(List<PhysicsPoint> data) {
+    if (data.isEmpty) return '';
+    final double avgMps = data.map((e) => e.value).reduce((a, b) => a + b) / data.length;
+    final double peakMps = data.map((e) => e.value).reduce(math.max);
+    return "  —  Avg: ${(avgMps * 2.23694).toStringAsFixed(1)} mph (${(avgMps * 3.6).toStringAsFixed(1)} kph) | "
+        "Peak: ${(peakMps * 2.23694).toStringAsFixed(1)} mph (${(peakMps * 3.6).toStringAsFixed(1)} kph)";
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Speed Tracker'), actions: _buildAppBarActions()),
+      backgroundColor: Colors.black,
+      body: !_isInitialized
+          ? const Center(child: CircularProgressIndicator())
+          : Column(
+              children: [
+                Expanded(child: _showGraphs ? _buildGraphPanel() : _buildFrame()),
+                if (_isProcessing)
+                  LinearProgressIndicator(value: _processingProgress, color: Colors.purpleAccent),
+                if (!_showGraphs) _buildMeasurementToolbar(),
+                _buildResultPanel(),
+              ],
+            ),
+    );
+  }
+
+  List<Widget> _buildAppBarActions() {
+    return [
+      IconButton(
+        icon: Icon(Icons.edit, color: _isSelectionMode ? Colors.purpleAccent : Colors.white54),
+        tooltip: "Selection Mode",
+        onPressed: () => setState(() => _isSelectionMode = true),
+      ),
+      IconButton(
+        icon: Icon(Icons.zoom_in, color: !_isSelectionMode ? Colors.blueAccent : Colors.white54),
+        tooltip: "Zoom Mode",
+        onPressed: () => setState(() => _isSelectionMode = false),
+      ),
+      IconButton(
+        icon: Icon(
+          _showGraphs ? Icons.video_library : Icons.bar_chart,
+          color: _showGraphs ? Colors.greenAccent : Colors.white,
+        ),
+        tooltip: _showGraphs ? "View Video" : "View Graphs",
+        onPressed: () => setState(() => _showGraphs = !_showGraphs),
+      ),
+    ];
+  }
+
+  Widget _buildMeasurementToolbar() {
+    final bool canTrack =
+        _startTrackMs != null && _endTrackMs != null && (_rect != null || _trackedRects.isNotEmpty);
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      color: Colors.black,
+      child: Row(
+        children: [
+          Expanded(
+            child: TextButton.icon(
+              onPressed: () => setState(() => _startTrackMs = _uiPosition.value),
+              icon: Icon(
+                Icons.start,
+                color: _startTrackMs != null ? Colors.greenAccent : Colors.white54,
+                size: 14,
+              ),
+              label: Text(
+                _startTrackMs == null ? "In" : _formatDuration(Duration(milliseconds: _startTrackMs!)),
+                style: const TextStyle(fontSize: 10),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ),
+          const SizedBox(width: 4),
+          ElevatedButton.icon(
+            onPressed: _isProcessing
+                ? () => setState(() => _stopTrackingRequested = true)
+                : (canTrack ? _startLocalCVTracking : null),
+            icon: Icon(_isProcessing ? Icons.stop : Icons.troubleshoot, size: 16),
+            label: Text(
+              _isProcessing ? "STOP" : "TRACK",
+              style: const TextStyle(fontWeight: FontWeight.w900, letterSpacing: 1.0, fontSize: 11),
+            ),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: _isProcessing ? Colors.orangeAccent : Colors.cyanAccent,
+              foregroundColor: Colors.black,
+              disabledBackgroundColor: Colors.cyanAccent.withValues(alpha: 0.15),
+              disabledForegroundColor: Colors.white38,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            ),
+          ),
+          const SizedBox(width: 4),
+          Expanded(
+            child: TextButton.icon(
+              onPressed: () => setState(() => _endTrackMs = _uiPosition.value),
+              icon: Icon(
+                Icons.output,
+                color: _endTrackMs != null ? Colors.redAccent : Colors.white54,
+                size: 14,
+              ),
+              label: Text(
+                _endTrackMs == null ? "Out" : _formatDuration(Duration(milliseconds: _endTrackMs!)),
+                style: const TextStyle(fontSize: 10),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.refresh, color: Colors.white54, size: 18),
+            tooltip: "Reset All",
+            onPressed: _resetAll,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFrame() {
+    return Column(
+      children: [
+        Expanded(
+          child: Stack(
+            children: [
+              InteractiveViewer(
+                transformationController: _transformationController,
+                panEnabled: !_isSelectionMode,
+                scaleEnabled: !_isSelectionMode,
+                minScale: 1.0,
+                maxScale: 40.0,
+                clipBehavior: Clip.none,
+                boundaryMargin: const EdgeInsets.all(double.infinity),
+                child: Center(
+                  child: AspectRatio(
+                    aspectRatio: ((_player.state.width ?? 0) > 0 && (_player.state.height ?? 0) > 0)
+                        ? _player.state.width! / _player.state.height!
+                        : 16 / 9,
+                    child: IgnorePointer(
+                      ignoring: !_isSelectionMode,
+                      child: RectangleSelector(
+                        rect: _rect,
+                        enabled: _isSelectionMode,
+                        onChanged: (nR) => setState(() {
+                          _rect = nR;
+                          if (nR != null) {
+                            _trackedRects.clear();
+                            _trackedBoundaries.clear();
+                            _sortedTrackedKeys.clear();
+                          }
+                        }),
+                        child: Stack(
+                          children: [
+                            RepaintBoundary(
+                              key: _videoKey,
+                              child: Video(controller: _controller, controls: NoVideoControls),
+                            ),
+                            ValueListenableBuilder<int>(
+                              valueListenable: _uiPosition,
+                              builder: (context, ms, _) {
+                                final aR = _getCurrentFrameRect(ms);
+                                final cK = _getClosestTrackedKey(ms);
+                                final fB = (cK != null) ? _trackedBoundaries[cK] : null;
+                                return Stack(
+                                  children: [
+                                    if (_sortedTrackedKeys.isNotEmpty)
+                                      Positioned.fill(
+                                        child: CustomPaint(
+                                          size: Size.infinite,
+                                          painter: TrajectoryPainter(_trackedRects, _sortedTrackedKeys, ms),
+                                        ),
+                                      ),
+                                    if (aR != null)
+                                      Positioned.fill(
+                                        child: CustomPaint(
+                                          size: Size.infinite,
+                                          painter: _RectPainter(aR, color: Colors.cyanAccent, thickness: 3.0),
+                                        ),
+                                      ),
+                                    if (fB != null)
+                                      Positioned.fill(
+                                        child: CustomPaint(
+                                          size: Size.infinite,
+                                          painter: BoundaryPainter(fB),
+                                        ),
+                                      ),
+                                  ],
+                                );
+                              },
+                            ),
+                            if (_boundaries.isNotEmpty)
+                              CustomPaint(
+                                painter: BoundaryPainter(_boundaries),
+                                size: Size.infinite,
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              Positioned(
+                top: 8,
+                left: 8,
+                child: CircleAvatar(
+                  backgroundColor: Colors.black54,
+                  child: IconButton(
+                    icon: _isProcessing
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                          )
+                        : const Icon(Icons.psychology, color: Colors.white),
+                    tooltip: "Preview SAM Trace",
+                    onPressed: _isProcessing ? null : _traceFrame,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        _buildScrubber(),
+        _buildDimensionInputs(),
+      ],
+    );
+  }
+
+  Widget _buildScrubber() {
+    return StreamBuilder<Duration>(
+      stream: _player.stream.duration,
+      builder: (context, snapshot) {
+        final Duration duration = snapshot.data ?? _player.state.duration;
+        final double max = math.max(100.0, duration.inMilliseconds.toDouble());
+
+        return Container(
+          color: Colors.grey.shade900,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+          child: Row(
+            children: [
+              IconButton(
+                icon: Icon(_player.state.playing ? Icons.pause : Icons.play_arrow),
+                onPressed: () => setState(() => _player.state.playing ? _player.pause() : _player.play()),
+              ),
+              Expanded(
+                child: ValueListenableBuilder<int>(
+                  valueListenable: _uiPosition,
+                  builder: (context, ms, _) {
+                    final double sliderMax = math.max(max, ms.toDouble() + 1000.0);
+                    final bool isLoaded = max > 100.0;
+
+                    return Slider(
+                      value: ms.toDouble().clamp(0.0, sliderMax),
+                      min: 0.0,
+                      max: sliderMax,
+                      activeColor: Colors.purpleAccent,
+                      onChangeStart: (_) {
+                        _isSeeking = true;
+                        if (_player.state.playing) _player.pause();
+                      },
+                      onChanged: isLoaded
+                          ? (nV) {
+                              final int tMs = nV.toInt();
+                              _uiPosition.value = tMs;
+                              if (!_seekInFlight) {
+                                _seekInFlight = true;
+                                _player.seek(Duration(milliseconds: tMs)).whenComplete(() {
+                                  _seekInFlight = false;
+                                });
+                              }
+                            }
+                          : null,
+                      onChangeEnd: (nV) async {
+                        final int tMs = nV.toInt();
+                        _uiPosition.value = tMs;
+                        await _player.seek(Duration(milliseconds: tMs));
+                        _seekInFlight = false;
+                        _isSeeking = false;
+                      },
+                    );
+                  },
+                ),
+              ),
+              ValueListenableBuilder<int>(
+                valueListenable: _uiPosition,
+                builder: (context, ms, _) => Text(
+                  _formatDuration(Duration(milliseconds: ms)),
+                  style: const TextStyle(color: Colors.white70, fontSize: 10, fontFamily: 'monospace'),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildDimensionInputs() {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
       color: Colors.black,
-      child: Column(children: [
-        Row(children: [
-          Text(lbl, style: const TextStyle(fontSize: 10, color: Colors.white70)),
-          const SizedBox(width: 8),
+      child: Row(
+        children: [
+          const Text("Height (m)", style: TextStyle(fontSize: 10, color: Colors.white70)),
+          const SizedBox(width: 6),
           Expanded(
             child: TextField(
-              controller: l,
-              enabled: _sortedTrackedKeys.isNotEmpty,
-              decoration: const InputDecoration(hintText: "Width (m)", isDense: true),
-              style: TextStyle(fontSize: 11, color: _sortedTrackedKeys.isEmpty ? Colors.white24 : Colors.white),
-              keyboardType: TextInputType.number,
-            ),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: TextField(
-              controller: h,
-              enabled: _sortedTrackedKeys.isNotEmpty,
-              decoration: const InputDecoration(hintText: "Height (m)", isDense: true),
-              style: TextStyle(fontSize: 11, color: _sortedTrackedKeys.isEmpty ? Colors.white24 : Colors.white),
-              keyboardType: TextInputType.number,
-            ),
-          ),
-        ]),
-        const SizedBox(height: 4),
-        Row(children: [
-          const Text("Lens Focal Length (mm eq)", style: TextStyle(fontSize: 10, color: Colors.white70)),
-          const SizedBox(width: 8),
-          Expanded(
-            child: TextField(
-              controller: _fMM,
-              decoration: const InputDecoration(hintText: "e.g. 26.0", isDense: true),
+              controller: _h,
+              decoration: const InputDecoration(hintText: "1.0", isDense: true),
               style: const TextStyle(fontSize: 11),
               keyboardType: TextInputType.number,
             ),
           ),
-          const Spacer(),
-        ]),
-      ]),
+          const SizedBox(width: 12),
+          const Text("Focal (mm)", style: TextStyle(fontSize: 10, color: Colors.white70)),
+          const SizedBox(width: 6),
+          Expanded(
+            child: TextField(
+              controller: _fMM,
+              decoration: const InputDecoration(hintText: "26.0", isDense: true),
+              style: const TextStyle(fontSize: 11),
+              keyboardType: TextInputType.number,
+            ),
+          ),
+          const SizedBox(width: 12),
+          const Text("SAM (f)", style: TextStyle(fontSize: 10, color: Colors.white70)),
+          const SizedBox(width: 6),
+          Expanded(
+            child: TextField(
+              controller: _samInterval,
+              enabled: !_isProcessing,
+              decoration: const InputDecoration(hintText: "1", isDense: true),
+              style: const TextStyle(fontSize: 11),
+              keyboardType: TextInputType.number,
+            ),
+          ),
+        ],
+      ),
     );
   }
 
   Widget _buildResultPanel() {
     return Container(
+      width: double.infinity,
       padding: const EdgeInsets.all(8),
       color: Colors.grey.shade900,
-      child: Column(children: [
-        Text(
-          _calculationResult,
-          style: const TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold, fontSize: 12),
-        ),
-        if (_velocityData.isNotEmpty) ...[
-          const SizedBox(height: 8),
-          SizedBox(
-            height: 80,
-            child: Row(children: [
-              Expanded(child: _buildGraph("Velocity (m/s)", _velocityData, Colors.cyanAccent)),
-              const SizedBox(width: 8),
-              Expanded(child: _buildGraph("Accel (m/s²)", _accelerationData, Colors.orangeAccent)),
-            ]),
-          )
-        ],
-      ]),
+      child: Text(
+        _calculationResult,
+        textAlign: TextAlign.center,
+        style: const TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold, fontSize: 12),
+      ),
     );
   }
 
-  Widget _buildGraph(String t, List<PhysicsPoint> d, Color c) {
-    return Column(children: [
-      Text(t, style: const TextStyle(fontSize: 9, color: Colors.white70)),
-      Expanded(
-        child: Container(
-          margin: const EdgeInsets.only(top: 4),
-          decoration: BoxDecoration(border: Border.all(color: Colors.white10), color: Colors.black26),
-          child: CustomPaint(size: Size.infinite, painter: GraphPainter(d, c)),
+  Widget _buildGraphPanel() {
+    if (_speedData.isEmpty) {
+      return const Center(
+        child: Text("No physics data yet.", style: TextStyle(color: Colors.white54)),
+      );
+    }
+    return Container(
+      color: Colors.black,
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+      child: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _buildGraphGroup("MOTION DYNAMICS", [
+              _buildPlot("Speed vs Time (m/s)${_formatSpeedStats(_speedData)}", _speedData, Colors.yellowAccent),
+            ]),
+            const SizedBox(height: 24),
+            _buildGraphGroup("3D SPATIAL COORDINATES & PIXEL HEIGHT VS TIME", [
+              _buildPlot(
+                "X(t) - Lateral (${_posXData.last.value.toStringAsFixed(2)} m)",
+                _posXData,
+                Colors.redAccent,
+              ),
+              _buildPlot(
+                "Y(t) - Vertical (${_posYData.last.value.toStringAsFixed(2)} m)",
+                _posYData,
+                Colors.greenAccent,
+              ),
+              _buildPlot(
+                "Z(t) - Depth (${_absZData.last.value.toStringAsFixed(2)} m)",
+                _absZData,
+                Colors.cyanAccent,
+              ),
+              _buildPlot(
+                "Filtered Pixel Height (${_filteredPixelHeightData.last.value.toStringAsFixed(1)} px)",
+                _filteredPixelHeightData,
+                Colors.lightBlueAccent,
+              ),
+            ]),
+            const SizedBox(height: 20),
+          ],
         ),
-      )
-    ]);
+      ),
+    );
+  }
+
+  Widget _buildGraphGroup(String title, List<Widget> graphs) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(title, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white38, letterSpacing: 1.1)),
+        const SizedBox(height: 12),
+        ...graphs.map((w) => Padding(padding: const EdgeInsets.only(bottom: 12), child: SizedBox(height: 100, child: w))),
+      ],
+    );
+  }
+
+  Widget _buildPlot(String title, List<PhysicsPoint> data, Color color) {
+    return Column(
+      children: [
+        Text(title, style: const TextStyle(fontSize: 9, color: Colors.white70)),
+        Expanded(
+          child: Container(
+            margin: const EdgeInsets.only(top: 4),
+            decoration: BoxDecoration(border: Border.all(color: Colors.white10), color: Colors.black26),
+            child: CustomPaint(size: Size.infinite, painter: GraphPainter(data, color)),
+          ),
+        ),
+      ],
+    );
   }
 }
+
+// =============================================================================
+// DATA MODELS & CUSTOM PAINTERS / WIDGETS
+// =============================================================================
 
 class PhysicsPoint {
   final double time, value;
   PhysicsPoint(this.time, this.value);
-}
-
-class Offset3D {
-  final double x, y, z;
-  Offset3D(this.x, this.y, this.z);
-  double distanceTo(Offset3D o) =>
-      math.sqrt(math.pow(x - o.x, 2) + math.pow(y - o.y, 2) + math.pow(z - o.z, 2));
 }
 
 class GraphPainter extends CustomPainter {
@@ -1298,127 +1262,46 @@ class GraphPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (data.length < 2) return;
+    if (data.isEmpty) return;
     double minV = data.map((e) => e.value).reduce(math.min);
     double maxV = data.map((e) => e.value).reduce(math.max);
     double minT = data.first.time;
     double maxT = data.last.time;
-    if (maxV == minV) maxV += 1.0;
-    if (maxT == minT) maxT += 1.0;
+    if ((maxV - minV).abs() < 1e-4) maxV += 1.0;
+    if ((maxT - minT).abs() < 1e-4) maxT += 1.0;
 
-    final paint = Paint()
-      ..color = color
-      ..strokeWidth = 1.5
-      ..style = PaintingStyle.stroke;
+    final gridPaint = Paint()..color = Colors.white10..strokeWidth = 1.0;
+    final double zeroY = (size.height - (0.0 - minV) / (maxV - minV) * size.height).clamp(0.0, size.height);
+    canvas.drawLine(Offset(0, zeroY), Offset(size.width, zeroY), gridPaint);
+    canvas.drawLine(Offset(0, size.height / 2), Offset(size.width, size.height / 2), gridPaint);
 
-    final path = Path();
+    final stemPaint = Paint()..color = color.withValues(alpha: 0.25)..strokeWidth = 1.0;
+    final linePaint = Paint()..color = color.withValues(alpha: 0.5)..strokeWidth = 1.0..style = PaintingStyle.stroke;
+    final dotPaint = Paint()..color = color..style = PaintingStyle.fill;
+
+    final Path path = Path();
     for (int i = 0; i < data.length; i++) {
       final x = (data[i].time - minT) / (maxT - minT) * size.width;
       final y = size.height - (data[i].value - minV) / (maxV - minV) * size.height;
+
+      canvas.drawLine(Offset(x, zeroY), Offset(x, y), stemPaint);
       if (i == 0) {
         path.moveTo(x, y);
       } else {
         path.lineTo(x, y);
       }
+      canvas.drawCircle(Offset(x, y), 3.0, dotPaint);
     }
-    canvas.drawPath(path, paint);
+    canvas.drawPath(path, linePaint);
   }
 
   @override
   bool shouldRepaint(covariant GraphPainter old) => true;
 }
 
-class ThreeDTrajectoryView extends StatefulWidget {
-  final List<Offset3D> points;
-  const ThreeDTrajectoryView({super.key, required this.points});
-  @override
-  State<ThreeDTrajectoryView> createState() => _ThreeDTrajectoryViewState();
-}
-
-class _ThreeDTrajectoryViewState extends State<ThreeDTrajectoryView> {
-  double _phi = 0.5, _theta = 0.5;
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onPanUpdate: (d) => setState(() {
-        _phi += d.delta.dx * 0.01;
-        _theta += d.delta.dy * 0.01;
-      }),
-      child: Container(
-        height: 250,
-        width: double.infinity,
-        decoration: BoxDecoration(
-          color: Colors.black,
-          border: Border.all(color: Colors.cyanAccent.withValues(alpha: 0.1)),
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: ClipRect(
-          child: CustomPaint(
-            painter: ThreeDPainter(widget.points, _phi, _theta),
-            size: Size.infinite,
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class ThreeDPainter extends CustomPainter {
-  final List<Offset3D> points;
-  final double phi, theta;
-  ThreeDPainter(this.points, this.phi, this.theta);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    if (points.isEmpty) return;
-    final center = Offset(size.width / 2, size.height / 2);
-    const double scale = 50.0;
-
-    Offset project(Offset3D p) {
-      double x1 = p.x * math.cos(phi) - p.z * math.sin(phi);
-      double z1 = p.x * math.sin(phi) + p.z * math.cos(phi);
-      double y2 = p.y * math.cos(theta) - z1 * math.sin(theta);
-      return Offset(center.dx + x1 * scale, center.dy + y2 * scale);
-    }
-
-    final axisPaint = Paint()..strokeWidth = 1.0;
-    void drawAxis(Offset3D end, Color color) {
-      canvas.drawLine(center, project(end), axisPaint..color = color.withValues(alpha: 0.5));
-    }
-
-    drawAxis(Offset3D(2, 0, 0), Colors.red);
-    drawAxis(Offset3D(0, 2, 0), Colors.green);
-    drawAxis(Offset3D(0, 0, 2), Colors.blue);
-
-    final linePaint = Paint()
-      ..color = Colors.cyanAccent
-      ..strokeWidth = 2.5
-      ..style = PaintingStyle.stroke
-      ..strokeCap = StrokeCap.round;
-
-    final path = Path();
-    for (int i = 0; i < points.length; i++) {
-      final p = project(points[i]);
-      if (i == 0) {
-        path.moveTo(p.dx, p.dy);
-      } else {
-        path.lineTo(p.dx, p.dy);
-      }
-    }
-    canvas.drawPath(path, linePaint);
-    canvas.drawCircle(project(points.first), 4.0, Paint()..color = Colors.greenAccent);
-    canvas.drawCircle(project(points.last), 4.0, Paint()..color = Colors.redAccent);
-  }
-
-  @override
-  bool shouldRepaint(covariant ThreeDPainter old) => true;
-}
-
 class RectangleSelector extends StatefulWidget {
   final Rect? rect;
   final Function(Rect?) onChanged;
-  final Function(int)? onTapTrace;
-  final List<List<Offset>> tracePoints;
   final Widget child;
   final bool enabled;
 
@@ -1426,8 +1309,6 @@ class RectangleSelector extends StatefulWidget {
     super.key,
     this.rect,
     required this.onChanged,
-    this.onTapTrace,
-    required this.tracePoints,
     required this.child,
     this.enabled = true,
   });
@@ -1447,46 +1328,33 @@ class _RectangleSelectorState extends State<RectangleSelector> {
         onPanStart: widget.enabled ? (d) => setState(() => _start = d.localPosition) : null,
         onPanUpdate: widget.enabled
             ? (d) {
-          if (_start == null) return;
-          final rect = Rect.fromPoints(_start!, d.localPosition);
-          widget.onChanged(Rect.fromLTRB(
-            (rect.left / size.width).clamp(0.0, 1.0),
-            (rect.top / size.height).clamp(0.0, 1.0),
-            (rect.right / size.width).clamp(0.0, 1.0),
-            (rect.bottom / size.height).clamp(0.0, 1.0),
-          ));
-        }
+                if (_start == null) return;
+                final rect = Rect.fromPoints(_start!, d.localPosition);
+                widget.onChanged(Rect.fromLTRB(
+                  (rect.left / size.width).clamp(0.0, 1.0),
+                  (rect.top / size.height).clamp(0.0, 1.0),
+                  (rect.right / size.width).clamp(0.0, 1.0),
+                  (rect.bottom / size.height).clamp(0.0, 1.0),
+                ));
+              }
             : null,
         onPanEnd: (_) => setState(() => _start = null),
         onTapDown: widget.enabled
             ? (d) {
-          if (widget.tracePoints.isNotEmpty && widget.onTapTrace != null) {
-            final tapPos = Offset(d.localPosition.dx / size.width, d.localPosition.dy / size.height);
-            for (int i = 0; i < widget.tracePoints.length; i++) {
-              final poly = widget.tracePoints[i];
-              final path = Path();
-              if (poly.isNotEmpty) {
-                path.moveTo(poly[0].dx, poly[0].dy);
-                for (var j = 1; j < poly.length; j++) path.lineTo(poly[j].dx, poly[j].dy);
-                path.close();
-                if (path.contains(tapPos)) {
-                  widget.onTapTrace!(i);
-                  return;
+                if (widget.rect != null &&
+                    !widget.rect!.contains(
+                        Offset(d.localPosition.dx / size.width, d.localPosition.dy / size.height))) {
+                  widget.onChanged(null);
                 }
               }
-            }
-          }
-          if (widget.rect != null &&
-              !widget.rect!.contains(
-                  Offset(d.localPosition.dx / size.width, d.localPosition.dy / size.height))) {
-            widget.onChanged(null);
-          }
-        }
             : null,
-        child: Stack(fit: StackFit.expand, children: [
-          widget.child,
-          if (widget.rect != null) CustomPaint(painter: _RectPainter(widget.rect!))
-        ]),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            widget.child,
+            if (widget.rect != null) CustomPaint(painter: _RectPainter(widget.rect!)),
+          ],
+        ),
       );
     });
   }
@@ -1508,16 +1376,6 @@ class _RectPainter extends CustomPainter {
     );
     canvas.drawRect(r, Paint()..color = color.withValues(alpha: 0.15));
     canvas.drawRect(r, Paint()..color = color..style = PaintingStyle.stroke..strokeWidth = thickness);
-    if (color == Colors.cyanAccent) {
-      canvas.drawRect(
-        r,
-        Paint()
-          ..color = color.withValues(alpha: 0.3)
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = thickness + 2
-          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 2),
-      );
-    }
   }
 
   @override
@@ -1525,32 +1383,26 @@ class _RectPainter extends CustomPainter {
 }
 
 class BoundaryPainter extends CustomPainter {
-  final List<List<Offset>> points;
-  final int? selectedIndex;
-  BoundaryPainter(this.points, {this.selectedIndex});
+  final List<Offset> points;
+  BoundaryPainter(this.points);
 
   @override
   void paint(Canvas canvas, Size size) {
+    if (points.length < 2) return;
     final stroke = Paint()
       ..color = Colors.purpleAccent
       ..style = PaintingStyle.stroke
       ..strokeWidth = 0.3;
-
-    for (int i = 0; i < points.length; i++) {
-      final poly = points[i];
-      if (poly.length < 2) continue;
-      final fill = Paint()
-        ..color = Colors.purpleAccent.withValues(alpha: 0.1)
-        ..style = PaintingStyle.fill;
-      final path = Path();
-      path.moveTo(poly.first.dx * size.width, poly.first.dy * size.height);
-      for (int j = 1; j < poly.length; j++) {
-        path.lineTo(poly[j].dx * size.width, poly[j].dy * size.height);
-      }
-      path.close();
-      canvas.drawPath(path, fill);
-      canvas.drawPath(path, stroke);
+    final fill = Paint()
+      ..color = Colors.purpleAccent.withValues(alpha: 0.1)
+      ..style = PaintingStyle.fill;
+    final path = Path()..moveTo(points.first.dx * size.width, points.first.dy * size.height);
+    for (int j = 1; j < points.length; j++) {
+      path.lineTo(points[j].dx * size.width, points[j].dy * size.height);
     }
+    path.close();
+    canvas.drawPath(path, fill);
+    canvas.drawPath(path, stroke);
   }
 
   @override
@@ -1570,12 +1422,12 @@ class TrajectoryPainter extends CustomPainter {
       ..color = Colors.cyanAccent.withValues(alpha: 0.6)
       ..strokeWidth = 3.5
       ..style = PaintingStyle.stroke
-      ..strokeCap = StrokeCap.round
-      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 2);
+      ..strokeCap = StrokeCap.round;
 
     final path = Path();
     final firstR = trackedRects[sortedKeys[0]];
     if (firstR != null) path.moveTo(firstR.center.dx * size.width, firstR.center.dy * size.height);
+
     for (int i = 1; i < sortedKeys.length; i++) {
       final key = sortedKeys[i];
       if (key > currentMs) break;
