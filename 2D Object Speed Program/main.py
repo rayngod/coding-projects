@@ -228,10 +228,10 @@ def calculate(t1, t2, f1, f2, vpx, vpy, depth_scale, duration, img_path, target_
         y_bottom[frame] = row["y_bottom"]
         pix_width[frame] = row["width"]
         
-    x1 = x[t1]
-    y1 = y_bottom[t1]
-    x2 = x[t2]
-    y2 = y_bottom[t2]
+    x1 = int(x[t1])
+    y1 = int(y_bottom[t1])
+    x2 = int(x[t2])
+    y2 = int(y_bottom[t2])
 
     if(x1 == -1 or y1 == -1 or x2 == -1 or y2 == -1):
         print("Unable to detect object")
