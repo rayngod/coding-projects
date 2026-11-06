@@ -9,7 +9,6 @@ from ultralytics import YOLO
 import supervision as sv
 
 def getVideo(video_path):
-    # --- Open the video ---
     cap = cv2.VideoCapture(video_path)
 
     if not cap.isOpened():
@@ -22,28 +21,23 @@ def loadFrames(cap):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"Total frames: {total_frames}")
 
-    output_folder = 'frames'       # Folder to save frames
+    output_folder = 'frames'
 
     if os.path.exists(output_folder):
-        # Remove all contents inside the folder
         for filename in os.listdir(output_folder):
             file_path = os.path.join(output_folder, filename)
-            try:
-                if os.path.isfile(file_path) or os.path.islink(file_path):
-                    os.unlink(file_path)  # Remove file or link
-                elif os.path.isdir(file_path):
-                    shutil.rmtree(file_path)  # Remove folder recursively
-            except Exception as e:
-                print(f'Failed to delete {file_path}. Reason: {e}')
+            if os.path.isfile(file_path) or os.path.islink(file_path):
+                os.unlink(file_path)
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path)
     else:
-        # Create output folder
         os.makedirs(output_folder, exist_ok=True)
 
     frame_num = 0
     while True:
         ret, frame = cap.read()
         if not ret:
-            break  # End of video
+            break
 
         filename = os.path.join(output_folder, f"frame_{frame_num}.jpg")
         cv2.imwrite(filename, frame)
@@ -64,7 +58,7 @@ def getTime(cap):
         time2 = float(input("Enter time 2: "))
         
 
-    #get frames
+    #get frames numbers
     t1 = math.floor(time1 * fps)
     t2 = math.floor(time2 * fps)
 
@@ -122,10 +116,9 @@ def getVP(img_path):
             img = img_orig.copy()
             cv2.line(img, (0, y), (image_width - 1, y), (0, 255, 0), 2)
             cv2.circle(img, (center_x, y), 6, (0, 255, 0), -1)
-            print(f"Vanishing Point height selected: y={y} (x fixed at center: {center_x})")
+            print(f"Vanishing Point height selected: y={y}")
             cv2.imshow(window_name, img)
 
-    print("\n--> Click the desired vanishing point height; x is fixed at the image center. Press any key to confirm.")
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(window_name, mouse_callback)
     cv2.imshow(window_name, img)
@@ -134,11 +127,8 @@ def getVP(img_path):
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
-    if vp_coordinates:
-        return vp_coordinates[0]
+    return vp_coordinates[0]
 
-    print(f"No height selected. Falling back to image center: ({center_x}, {image_height / 2})")
-    return (center_x, image_height // 2)
 
 
 def objectDetection(video_path):
@@ -158,8 +148,6 @@ def objectDetection(video_path):
     label_annotator = sv.LabelAnnotator()
     trace_annotator = sv.TraceAnnotator()
 
-    # Constants
-    MIN_AREA = 50
     position_data = []
 
     # Expand bounding boxes
@@ -177,20 +165,16 @@ def objectDetection(video_path):
         detections = sv.Detections.from_ultralytics(results)
 
         # Filter out tiny objects
-        detections = detections[detections.area > MIN_AREA]
+        detections = detections[detections.area > 50]
 
         if len(detections) == 0:
             return frame 
 
-        # Expand boxes for tracking. Only need bounding box info
         detections.xyxy = np.array([
             expand_box(box) for box in detections.xyxy
         ])
 
-        # Track
         detections = tracker.update_with_detections(detections)
-
-        # Labels
         labels = [
             f"#{tid} {results.names[cid]}"
             for cid, tid in zip(detections.class_id, detections.tracker_id)
@@ -216,14 +200,12 @@ def objectDetection(video_path):
 
         return annotated
 
-    # Process video
     sv.process_video(
         source_path=video_path,
         target_path="output/pp.mp4",
         callback=callback
     )
 
-    # Save CSV
     df = pd.DataFrame(
         position_data,
         columns=["frame", "tracker_id", "x_center", "y_bottom", "width"],
@@ -231,13 +213,8 @@ def objectDetection(video_path):
     df.to_csv("output/positions.csv", index=False)
 
 def calculate(t1, t2, f1, f2, vpx, vpy, depth_scale, duration, img_path, target_id):
-    # Load CSV
     df = pd.read_csv("output/positions.csv")
-
-    # Filter for the target ID only
     filtered = df[df["tracker_id"] == target_id]
-
-    # Get total number of frames in the dataset
     max_frame = df["frame"].max()
 
     # Initialize with -1 for all frames
@@ -264,7 +241,7 @@ def calculate(t1, t2, f1, f2, vpx, vpy, depth_scale, duration, img_path, target_
             #avoid divide by 0
             x_projected = x1
         else:
-            m = (vpy - y1) / (vpx - x1)  # slope of the line
+            m = (vpy - y1) / (vpx - x1)
             x_projected = ((y2 - y1) / m) + x1
 
         width_scale = get_width_scale(img_path, vpy, y2)
@@ -285,14 +262,13 @@ def get_width_scale(img_path, vpy, target_y):
     img = cv2.imread(img_path)
     if img is None:
         raise ValueError(f"Could not load image {img_path} for width calibration.")
-
+    
     clicked_points = []
     window_name = "Width Calibration (Select Reference Ends)"
 
     def mouse_callback(event, x, y, flags, param):
         if event != cv2.EVENT_LBUTTONDOWN or len(clicked_points) >= 2:
             return
-
         if clicked_points:
             y = clicked_points[0][1]
         clicked_points.append((x, y))
@@ -303,7 +279,6 @@ def get_width_scale(img_path, vpy, target_y):
             cv2.line(img, clicked_points[0], clicked_points[1], (0, 255, 0), 2)
         cv2.imshow(window_name, img)
 
-    print("\n--> Click the two ends of a reference with a known real-world width, then press any key.")
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(window_name, mouse_callback)
     cv2.imshow(window_name, img)
@@ -312,27 +287,13 @@ def get_width_scale(img_path, vpy, target_y):
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
-    if len(clicked_points) != 2:
-        raise ValueError("Width calibration requires two clicked reference endpoints.")
-
     pixel_width = abs(clicked_points[1][0] - clicked_points[0][0])
-    if pixel_width == 0:
-        raise ValueError("The clicked reference endpoints must be different.")
-
     known_width = float(input("Real-world width of reference (meters): "))
-    if not math.isfinite(known_width) or known_width <= 0:
-        raise ValueError("Reference width must be a positive, finite number.")
 
-    calibration_y = (clicked_points[0][1] + clicked_points[1][1]) / 2
-    calibration_offset = abs(calibration_y - vpy)
-    target_offset = abs(target_y - vpy)
-    if calibration_offset == 0 or target_offset == 0:
-        raise ValueError("Width calibration cannot be performed at the vanishing-point row.")
-    if (calibration_y - vpy) * (target_y - vpy) < 0:
-        raise ValueError("Reference and target must be on the same side of the vanishing point.")
-
-    # Meters per pixel vary inversely with distance from the vanishing-point row.
-    return (known_width / pixel_width) * (calibration_offset / target_offset)
+    cur_y = (clicked_points[0][1] + clicked_points[1][1]) / 2
+    dist = abs(cur_y - vpy)
+    target = abs(target_y - vpy)
+    return (known_width / pixel_width) * (dist / target)
 
 
 def get_depth_scale(img_path, depth):             
@@ -342,15 +303,11 @@ def get_depth_scale(img_path, depth):
     def mouse_callback(event, x, y, flags, param):
         if event != cv2.EVENT_LBUTTONDOWN or len(clicked_points) >= 2:
             return
-
         if clicked_points:
             x = clicked_points[0][0]
         depth_value = depth[y, x]
         print(f"Clicked at pixel: ({x}, {y}), Depth: {depth_value:.4f} meters")
         clicked_points.append((x, y, depth_value))
-
-        # Draw a red dot on the clicked location
-
         cv2.circle(img, (x, y), 5, (0, 0, 255), -1)
         if len(clicked_points) == 1:
             cv2.line(img, (x, 0), (x, img.shape[0] - 1), (255, 255, 0), 1)
@@ -358,7 +315,6 @@ def get_depth_scale(img_path, depth):
             cv2.line(img, (x, clicked_points[0][1]), (x, y), (0, 255, 0), 2)
         cv2.imshow('Depth Calibration (Select Reference Ends)', img)
 
-    print("\n--> Action Required: Click the two vertical endpoints of your reference depth, then press any key to continue.")
     cv2.namedWindow('Depth Calibration (Select Reference Ends)', cv2.WINDOW_NORMAL)
     cv2.setMouseCallback('Depth Calibration (Select Reference Ends)', mouse_callback)
     cv2.imshow('Depth Calibration (Select Reference Ends)', img)
@@ -367,8 +323,7 @@ def get_depth_scale(img_path, depth):
     cv2.waitKey(0)
     cv2.destroyAllWindows()
     
-    known_real_length = float(input("Real Life Depth of Reference Object (Meters): "))
-    # Extract point info
+    known_real_length = float(input("Real World Depth of Reference Object (Meters): "))
     x1, y1, d1 = clicked_points[0]
     x2, y2, d2 = clicked_points[1]
 
