@@ -91,10 +91,10 @@ class A2CAgent:
             R = r + self.gamma * R
             returns.insert(0, R)
             
-        returns = torch.FloatTensor(returns).to(device).view(-1) # Force 1D
-        log_probs = torch.stack(log_probs).view(-1)             # Force 1D
-        values = torch.stack(values).view(-1)                   # Force 1D
-        entropies = torch.stack(entropies).view(-1)             # Force 1D
+        returns = torch.FloatTensor(returns).to(device).view(-1) 
+        log_probs = torch.stack(log_probs).view(-1)             
+        values = torch.stack(values).view(-1)                   
+        entropies = torch.stack(entropies).view(-1)             
         
         advantage = returns - values.detach()
         actor_loss = -(log_probs * advantage).mean()
@@ -111,13 +111,7 @@ class A2CAgent:
         self.optimizer.step()
         torch.cuda.empty_cache()
 
-# 4. Main Training Loop
 if __name__ == "__main__":
-    # Start a fresh record for this training run.
-    with open("highscore.txt", "w") as file:
-        file.write("0")
-    high_score = 0
-
     env = gym.make('ALE/SpaceInvaders-v5', render_mode="rgb_array")
     agent = A2CAgent(env.action_space.n)
     model_dir = "models"
@@ -133,7 +127,8 @@ if __name__ == "__main__":
     episodes = 1000000
     reward_history = []
     recent_rewards = deque(maxlen=100)
-
+    high_score = 0
+    
     for e in range(start_episode, episodes):
         raw_state, _ = env.reset()
         stacked_frames = deque(maxlen=8)
