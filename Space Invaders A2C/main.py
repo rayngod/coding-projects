@@ -214,11 +214,7 @@ if __name__ == "__main__":
         print(f"Episode: {e+1}, Score: {total_reward}, {len(recent_rewards)}-episode average: {average:.2f}")
 
         if (e + 1) % 10 == 0:
-            torch.save({
-                "episode": e,
-                "model_state_dict": agent.model.state_dict(),
-                "optimizer_state_dict": agent.optimizer.state_dict(),
-            }, model_path)
+            torch.save(agent.model.state_dict(), model_path)
             print(f"Saved training checkpoint to {model_path}")
 
     env.close()
